@@ -1,0 +1,14 @@
+{
+  "paper_trading": true,
+
+  "lot_mode": "fixed",
+  "fixed_lot_size": 1000,
+
+  "account_balance": 10000,
+  "risk_per_trade_percent": 1,
+
+  "stop_loss_pips": 5,
+  "take_profit_pips": 10,
+
+  "pip_value_per_1000": 0.10
+}
