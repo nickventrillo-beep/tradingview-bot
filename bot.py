@@ -1,16 +1,21 @@
-from flask import Flask, request
+import os
 import json
 import datetime
 from zoneinfo import ZoneInfo
+
+import requests
+from flask import Flask, request
 
 
 app = Flask(__name__)
 
 current_trades = {}
 
-TRADES_FILE = "trades.xlsx"
 SETTINGS_FILE = "settings.json"
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
+
+GOOGLE_SHEETS_URL = "https://script.google.com/macros/s/AKfycbxf92DRaIMRn9E_FmlbRsVvytwg9j7LzxnbcDdoi6qlYBex0hxdhCLiIhwldbyzWPrrhg/exec"
+SECRET = "chidrew1"
 
 
 def load_settings():
@@ -22,12 +27,21 @@ def now_bangkok():
     return datetime.datetime.now(BANGKOK_TZ)
 
 
+def send_to_google_sheets(trade_data):
+    try:
+        payload = {
+            "secret": SECRET,
+            **trade_data
+        }
+
+        response = requests.post(GOOGLE_SHEETS_URL, json=payload, timeout=10)
+        print(f"Google Sheets response: {response.status_code} {response.text}")
+
+    except Exception as e:
+        print(f"ERROR sending to Google Sheets: {e}")
+
+
 def to_bangkok_time(tv_time):
-    """
-    Converts TradingView UTC/Zulu time to readable Bangkok time.
-    Example:
-    2026-04-24T15:44:00Z -> 2026-04-24 22:44:00
-    """
     try:
         dt = datetime.datetime.fromisoformat(tv_time.replace("Z", "+00:00"))
         return dt.astimezone(BANGKOK_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -111,40 +125,14 @@ def official_exit_price(symbol, side, entry, alert_price, reason, signal, settin
     return alert_price
 
 
-def log_trade(data):
-    try:
-        df = pd.read_excel(TRADES_FILE)
-    except Exception:
-        df = pd.DataFrame()
-
-    df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
-    df.to_excel(TRADES_FILE, index=False)
-
-    try:
-        wb = load_workbook(TRADES_FILE)
-        ws = wb.active
-
-        headers = [cell.value for cell in ws[1]]
-
-        if "profit" in headers:
-            profit_col = headers.index("profit") + 1
-            for row in range(2, ws.max_row + 1):
-                ws.cell(row=row, column=profit_col).number_format = '$#,##0.00;-$#,##0.00'
-
-        wb.save(TRADES_FILE)
-
-    except Exception as e:
-        print(f"WARNING: could not format Excel file: {e}")
-
-
 @app.route("/", methods=["POST"])
 def webhook():
     global current_trades
 
-    data = request.json
+    data = request.json or {}
     settings = load_settings()
 
-    if data.get("secret") != "chidrew1":
+    if data.get("secret") != SECRET:
         return {"status": "unauthorized"}
 
     action = data.get("action")
@@ -261,6 +249,8 @@ def webhook():
         print(f"EXIT {side.upper()} {symbol} @ {exit_price}")
         print(f"PIPS: {round(pips, 2)} | PROFIT: ${round(profit, 2)} | DURATION: {duration}")
 
+        send_to_google_sheets(result)
+
         del current_trades[symbol]
 
         return {
@@ -284,8 +274,6 @@ def status():
         "open_trades": current_trades
     }
 
-
-import os
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
