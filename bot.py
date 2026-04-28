@@ -24,28 +24,32 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1").strip()
 
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1000"))
-REENTRY_BLOCK_MINUTES = int(os.getenv("REENTRY_BLOCK_MINUTES", "15"))
+REENTRY_BLOCK_MINUTES = int(os.getenv("REENTRY_BLOCK_MINUTES", "10"))
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
 # =====================================================
-# RAILWAY CONTROL VARIABLES
+# BOT DECISION VARIABLES
+# More-trades defaults
 # =====================================================
 
-MIN_ADX = float(os.getenv("MIN_ADX", "28"))
-MIN_TRADE_BIAS = float(os.getenv("MIN_TRADE_BIAS", "65"))
-MIN_EMA_SPREAD = float(os.getenv("MIN_EMA_SPREAD", "0.05"))
+MIN_ADX = float(os.getenv("MIN_ADX", "22"))
+MIN_TRADE_BIAS = float(os.getenv("MIN_TRADE_BIAS", "55"))
+MIN_EMA_SPREAD = float(os.getenv("MIN_EMA_SPREAD", "0.03"))
 MIN_SCORE_GAP = float(os.getenv("MIN_SCORE_GAP", "0"))
 
-REQUIRE_TRENDING = os.getenv("REQUIRE_TRENDING", "true").lower() == "true"
+BOT_STOP_LOSS_PIPS = float(os.getenv("BOT_STOP_LOSS_PIPS", "5"))
+BOT_TAKE_PROFIT_PIPS = float(os.getenv("BOT_TAKE_PROFIT_PIPS", "10"))
+
+REQUIRE_TRENDING = os.getenv("REQUIRE_TRENDING", "false").lower() == "true"
 REQUIRE_HTF = os.getenv("REQUIRE_HTF", "true").lower() == "true"
 REQUIRE_DI_ALIGNMENT = os.getenv("REQUIRE_DI_ALIGNMENT", "true").lower() == "true"
 REQUIRE_SCORE_DOMINANCE = os.getenv("REQUIRE_SCORE_DOMINANCE", "true").lower() == "true"
 
 ALLOW_PULLBACKS = os.getenv("ALLOW_PULLBACKS", "true").lower() == "true"
-ALLOW_CONTINUATIONS = os.getenv("ALLOW_CONTINUATIONS", "false").lower() == "true"
+ALLOW_CONTINUATIONS = os.getenv("ALLOW_CONTINUATIONS", "true").lower() == "true"
 
 # =====================================================
-# GOOGLE SHEET HEADERS - MATCHES YOUR SHEET1 FORMAT
+# GOOGLE SHEET HEADERS
 # =====================================================
 
 HEADERS = [
@@ -66,6 +70,8 @@ HEADERS = [
 
 PULLBACK_SIGNALS = {"buy_pullback", "sell_pullback"}
 CONTINUATION_SIGNALS = {"buy_continuation", "sell_continuation"}
+ENTRY_SIGNALS = PULLBACK_SIGNALS | CONTINUATION_SIGNALS
+
 ALLOWED_EXIT_SIGNALS = {
     "exit_buy",
     "exit_sell",
@@ -144,9 +150,22 @@ def calc_profit(pips, lot_size):
     return round(pips * (lot_size / 10000), 2)
 
 
+def stop_take_prices(symbol, side, entry):
+    pip_size = pip_size_for_symbol(symbol)
+
+    if side == "buy":
+        stop_price = entry - BOT_STOP_LOSS_PIPS * pip_size
+        take_price = entry + BOT_TAKE_PROFIT_PIPS * pip_size
+    else:
+        stop_price = entry + BOT_STOP_LOSS_PIPS * pip_size
+        take_price = entry - BOT_TAKE_PROFIT_PIPS * pip_size
+
+    return stop_price, take_price
+
+
 def log_reject(symbol, signal, reason):
     print("====================================")
-    print(f"IGNORED TRADE: {symbol}")
+    print(f"IGNORED: {symbol}")
     print(f"SIGNAL: {signal}")
     print(f"REASON: {reason}")
     print("====================================")
@@ -261,7 +280,7 @@ def append_closed_trade(trade, exit_signal, exit_reason, exit_price, exit_dt):
         return False
 
 # =====================================================
-# FILTERING LOGIC
+# METRICS / ENTRY DECISION
 # =====================================================
 
 def extract_metrics(data):
@@ -274,7 +293,6 @@ def extract_metrics(data):
         "htf_dist_pct": safe_float(data.get("htf_dist_pct"), 0),
         "plus_di": safe_float(data.get("plus_di"), 0),
         "minus_di": safe_float(data.get("minus_di"), 0),
-        # Pine hidden plots: market_state 1=TRENDING, 0=SIDEWAYS; htf_bias 1=BULLISH, -1=BEARISH, 0=NEUTRAL
         "market_state": safe_float(data.get("market_state"), 0),
         "htf_bias": safe_float(data.get("htf_bias"), 0),
     }
@@ -287,7 +305,7 @@ def should_accept_entry(symbol, side, signal, event_dt, metrics):
     if signal in CONTINUATION_SIGNALS and not ALLOW_CONTINUATIONS:
         return False, "continuations disabled"
 
-    if signal not in PULLBACK_SIGNALS and signal not in CONTINUATION_SIGNALS:
+    if signal not in ENTRY_SIGNALS:
         return False, f"entry signal not allowed: {signal}"
 
     if symbol in current_trades:
@@ -341,6 +359,73 @@ def should_accept_entry(symbol, side, signal, event_dt, metrics):
     return True, "accepted"
 
 # =====================================================
+# CLOSE LOGIC
+# =====================================================
+
+def close_trade(symbol, exit_signal, exit_reason, exit_price, exit_dt):
+    trade = current_trades.get(symbol)
+    if not trade:
+        log_reject(symbol, exit_signal, "no open trade")
+        return jsonify({
+            "status": "ignored",
+            "symbol": symbol,
+            "signal": exit_signal,
+            "reason": "no open trade",
+        })
+
+    pips = calc_pips(symbol, trade["side"], trade["entry"], exit_price)
+    profit = calc_profit(pips, trade["lot_size"])
+
+    wrote = append_closed_trade(trade, exit_signal, exit_reason, exit_price, exit_dt)
+
+    del current_trades[symbol]
+    last_exit_time_by_symbol[symbol] = exit_dt
+
+    log_close(symbol, trade["side"], trade["entry"], exit_price, pips, profit, exit_reason)
+
+    return jsonify({
+        "status": "closed",
+        "symbol": symbol,
+        "side": trade["side"],
+        "sheet_written": wrote,
+        "pips": pips,
+        "profit": profit,
+        "exit_reason": exit_reason,
+    })
+
+
+def process_price_update(symbol, price, high, low, event_dt):
+    trade = current_trades.get(symbol)
+    if not trade:
+        return jsonify({
+            "status": "ok",
+            "symbol": symbol,
+            "message": "price update received, no open trade",
+        })
+
+    side = trade["side"]
+    entry = trade["entry"]
+    stop_price, take_price = stop_take_prices(symbol, side, entry)
+
+    if side == "buy":
+        if low <= stop_price:
+            return close_trade(symbol, "stop_loss_buy", "stop_loss", stop_price, event_dt)
+        if high >= take_price:
+            return close_trade(symbol, "take_profit_buy", "take_profit", take_price, event_dt)
+
+    if side == "sell":
+        if high >= stop_price:
+            return close_trade(symbol, "stop_loss_sell", "stop_loss", stop_price, event_dt)
+        if low <= take_price:
+            return close_trade(symbol, "take_profit_sell", "take_profit", take_price, event_dt)
+
+    return jsonify({
+        "status": "ok",
+        "symbol": symbol,
+        "message": "price update received, trade still open",
+    })
+
+# =====================================================
 # ROUTES
 # =====================================================
 
@@ -349,19 +434,23 @@ def health_check():
     return jsonify({
         "status": "ok",
         "service": "tradingview-bot",
+        "mode": "pine broad alerts, bot decides",
         "filters": {
             "MIN_ADX": MIN_ADX,
             "MIN_TRADE_BIAS": MIN_TRADE_BIAS,
             "MIN_EMA_SPREAD": MIN_EMA_SPREAD,
+            "MIN_SCORE_GAP": MIN_SCORE_GAP,
+            "BOT_STOP_LOSS_PIPS": BOT_STOP_LOSS_PIPS,
+            "BOT_TAKE_PROFIT_PIPS": BOT_TAKE_PROFIT_PIPS,
             "REQUIRE_TRENDING": REQUIRE_TRENDING,
             "REQUIRE_HTF": REQUIRE_HTF,
             "REQUIRE_DI_ALIGNMENT": REQUIRE_DI_ALIGNMENT,
             "REQUIRE_SCORE_DOMINANCE": REQUIRE_SCORE_DOMINANCE,
             "ALLOW_PULLBACKS": ALLOW_PULLBACKS,
             "ALLOW_CONTINUATIONS": ALLOW_CONTINUATIONS,
-            "MIN_SCORE_GAP": MIN_SCORE_GAP,
             "REENTRY_BLOCK_MINUTES": REENTRY_BLOCK_MINUTES,
-        }
+        },
+        "open_trades": current_trades,
     })
 
 
@@ -397,7 +486,12 @@ def webhook():
 
         if not accepted:
             log_reject(symbol, signal, reject_reason)
-            return jsonify({"status": "ignored", "symbol": symbol, "signal": signal, "reason": reject_reason})
+            return jsonify({
+                "status": "ignored",
+                "symbol": symbol,
+                "signal": signal,
+                "reason": reject_reason,
+            })
 
         current_trades[symbol] = {
             "symbol": symbol,
@@ -409,37 +503,64 @@ def webhook():
             "metrics": metrics,
         }
 
+        stop_price, take_price = stop_take_prices(symbol, side, price)
+
         log_accept(symbol, side, signal, price, metrics)
-        return jsonify({"status": "accepted", "symbol": symbol, "side": side, "signal": signal})
+
+        return jsonify({
+            "status": "accepted",
+            "symbol": symbol,
+            "side": side,
+            "signal": signal,
+            "entry": price,
+            "stop_price": stop_price,
+            "take_price": take_price,
+        })
+
+    if action == "update":
+        high = safe_float(data.get("high"), price)
+        low = safe_float(data.get("low"), price)
+        return process_price_update(symbol, price, high, low, event_dt)
 
     if action == "exit":
         if signal not in ALLOWED_EXIT_SIGNALS:
             log_reject(symbol, signal, f"exit signal not allowed: {signal}")
-            return jsonify({"status": "ignored", "symbol": symbol, "signal": signal, "reason": "exit signal not allowed"})
+            return jsonify({
+                "status": "ignored",
+                "symbol": symbol,
+                "signal": signal,
+                "reason": "exit signal not allowed",
+            })
 
         trade = current_trades.get(symbol)
         if not trade:
             log_reject(symbol, signal, "no open trade")
-            return jsonify({"status": "ignored", "symbol": symbol, "signal": signal, "reason": "no open trade"})
+            return jsonify({
+                "status": "ignored",
+                "symbol": symbol,
+                "signal": signal,
+                "reason": "no open trade",
+            })
 
         if side and side != trade["side"]:
             log_reject(symbol, signal, f"side mismatch: alert={side}, open={trade['side']}")
-            return jsonify({"status": "ignored", "symbol": symbol, "signal": signal, "reason": "side mismatch"})
+            return jsonify({
+                "status": "ignored",
+                "symbol": symbol,
+                "signal": signal,
+                "reason": "side mismatch",
+            })
 
-        pips = calc_pips(symbol, trade["side"], trade["entry"], price)
-        profit = calc_profit(pips, trade["lot_size"])
-
-        wrote = append_closed_trade(trade, signal, reason, price, event_dt)
-
-        del current_trades[symbol]
-        last_exit_time_by_symbol[symbol] = event_dt
-
-        log_close(symbol, trade["side"], trade["entry"], price, pips, profit, reason)
-
-        return jsonify({"status": "closed", "symbol": symbol, "side": trade["side"], "sheet_written": wrote, "pips": pips, "profit": profit})
+        return close_trade(symbol, signal, reason, price, event_dt)
 
     log_reject(symbol, signal, f"unknown action: {action}")
-    return jsonify({"status": "ignored", "symbol": symbol, "signal": signal, "reason": "unknown action"}), 400
+    return jsonify({
+        "status": "ignored",
+        "symbol": symbol,
+        "signal": signal,
+        "reason": "unknown action",
+    }), 400
+
 
 # =====================================================
 # START SERVER - REQUIRED FOR RAILWAY
