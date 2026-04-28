@@ -12,13 +12,13 @@ app = Flask(__name__)
 # SETTINGS
 # =========================
 
-SECRET = os.getenv("SECRET", "chidrew1")
+SECRET = os.getenv("WEBHOOK_SECRET", "chidrew1")
 
-STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", 5))
-TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", 7))
+STOP_LOSS_PIPS = float(os.getenv("BOT_STOP_LOSS_PIPS", 5))
+TAKE_PROFIT_PIPS = float(os.getenv("BOT_TAKE_PROFIT_PIPS", 7))
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
