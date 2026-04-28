@@ -20,24 +20,39 @@ TAKE_PROFIT_PIPS = float(os.getenv("BOT_TAKE_PROFIT_PIPS", 7))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
+LOT_SIZE = float(os.getenv("LOT_SIZE", 1000))
+
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
 current_trades = {}
 
 
 # =========================
-# HELPERS
+# TIME HELPERS
 # =========================
 
-def now_bangkok():
-    return datetime.now(BANGKOK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+def now_bangkok_dt():
+    return datetime.now(BANGKOK_TZ)
 
+
+def fmt_bangkok(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def trade_duration(start_dt, end_dt):
+    seconds = max(0, int((end_dt - start_dt).total_seconds()))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+# =========================
+# PRICE HELPERS
+# =========================
 
 def get_pip_size(symbol):
-    symbol = symbol.upper()
-    if "JPY" in symbol:
-        return 0.01
-    return 0.0001
+    return 0.01 if "JPY" in symbol.upper() else 0.0001
 
 
 def pips_between(entry_price, exit_price, side, symbol):
@@ -52,31 +67,8 @@ def pips_between(entry_price, exit_price, side, symbol):
     return 0
 
 
-def get_sheet():
-    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
-        print("Google Sheets not configured.")
-        return None
-
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(creds)
-
-    return client.open_by_key(GOOGLE_SHEET_ID).sheet1
-
-
-def write_trade_to_sheet(row):
-    sheet = get_sheet()
-    if sheet:
-        sheet.append_row(row)
-        print("Sent to Google Sheets:", row)
-    else:
-        print("Trade row:", row)
+def profit_from_pips(pips):
+    return round(pips * (LOT_SIZE / 10000), 2)
 
 
 def calculate_sl_tp(entry_price, side, symbol):
@@ -85,7 +77,6 @@ def calculate_sl_tp(entry_price, side, symbol):
     if side == "buy":
         stop_loss_price = entry_price - (STOP_LOSS_PIPS * pip)
         take_profit_price = entry_price + (TAKE_PROFIT_PIPS * pip)
-
     else:
         stop_loss_price = entry_price + (STOP_LOSS_PIPS * pip)
         take_profit_price = entry_price - (TAKE_PROFIT_PIPS * pip)
@@ -93,91 +84,86 @@ def calculate_sl_tp(entry_price, side, symbol):
     return round(stop_loss_price, 5), round(take_profit_price, 5)
 
 
+# =========================
+# GOOGLE SHEETS
+# =========================
+
+def get_sheet():
+    if not GOOGLE_SHEET_ID:
+        print("Google Sheets not configured: GOOGLE_SHEET_ID missing")
+        return None
+
+    if not GOOGLE_CREDENTIALS_JSON:
+        print("Google Sheets not configured: GOOGLE_SERVICE_ACCOUNT_JSON missing")
+        return None
+
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+
+        return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+    except Exception as e:
+        print(f"Google Sheets setup failed: {e}")
+        return None
+
+
+def write_trade_to_sheet(row):
+    sheet = get_sheet()
+
+    if sheet:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        print("Sent to Google Sheets:", row)
+        return True
+
+    print("Trade row not written:", row)
+    return False
+
+
+# =========================
+# TRADE LOGIC
+# =========================
+
 def check_hard_exit(trade, current_price):
-    """
-    This is the key fix.
-
-    Stop loss and take profit are checked FIRST.
-    Indicator exits only happen later.
-    """
-
     side = trade["side"]
-    symbol = trade["symbol"]
-    entry_price = trade["entry_price"]
     stop_loss_price = trade["stop_loss_price"]
     take_profit_price = trade["take_profit_price"]
 
     if side == "buy":
         if current_price <= stop_loss_price:
-            return "stop_loss_buy", stop_loss_price
+            return "stop_loss_buy", "stop_loss", stop_loss_price
 
         if current_price >= take_profit_price:
-            return "take_profit_buy", take_profit_price
+            return "take_profit_buy", "take_profit", take_profit_price
 
     if side == "sell":
         if current_price >= stop_loss_price:
-            return "stop_loss_sell", stop_loss_price
+            return "stop_loss_sell", "stop_loss", stop_loss_price
 
         if current_price <= take_profit_price:
-            return "take_profit_sell", take_profit_price
+            return "take_profit_sell", "take_profit", take_profit_price
 
-    return None, None
-
-
-def close_trade(symbol, exit_price, exit_reason):
-    trade = current_trades.get(symbol)
-
-    if not trade:
-        return {
-            "status": "ignored",
-            "reason": "no open trade"
-        }
-
-    entry_price = trade["entry_price"]
-    side = trade["side"]
-
-    profit_pips = pips_between(entry_price, exit_price, side, symbol)
-
-    row = [
-        now_bangkok(),
-        symbol,
-        side,
-        trade["signal"],
-        entry_price,
-        exit_price,
-        profit_pips,
-        exit_reason,
-        trade["entry_time"],
-        trade["stop_loss_price"],
-        trade["take_profit_price"]
-    ]
-
-    write_trade_to_sheet(row)
-
-    print(f"CLOSED {symbol} {side} | {exit_reason} | {profit_pips} pips")
-
-    del current_trades[symbol]
-
-    return {
-        "status": "closed",
-        "symbol": symbol,
-        "side": side,
-        "exit_reason": exit_reason,
-        "entry_price": entry_price,
-        "exit_price": exit_price,
-        "profit_pips": profit_pips
-    }
+    return None, None, None
 
 
 def open_trade(symbol, side, signal, price):
+    entry_dt = now_bangkok_dt()
     stop_loss_price, take_profit_price = calculate_sl_tp(price, side, symbol)
 
     current_trades[symbol] = {
         "symbol": symbol,
         "side": side,
-        "signal": signal,
+        "entry_signal": signal,
         "entry_price": price,
-        "entry_time": now_bangkok(),
+        "entry_dt": entry_dt,
+        "entry_time": fmt_bangkok(entry_dt),
         "stop_loss_price": stop_loss_price,
         "take_profit_price": take_profit_price
     }
@@ -191,20 +177,85 @@ def open_trade(symbol, side, signal, price):
         "status": "opened",
         "symbol": symbol,
         "side": side,
-        "signal": signal,
+        "entry_signal": signal,
         "entry_price": price,
         "stop_loss_price": stop_loss_price,
         "take_profit_price": take_profit_price
     }
 
 
+def close_trade(symbol, exit_price, exit_signal, exit_reason):
+    trade = current_trades.get(symbol)
+
+    if not trade:
+        return {
+            "status": "ignored",
+            "reason": "no open trade"
+        }
+
+    exit_dt = now_bangkok_dt()
+
+    side = trade["side"]
+    entry_price = trade["entry_price"]
+
+    pips = pips_between(entry_price, exit_price, side, symbol)
+    profit = profit_from_pips(pips)
+
+    # EXACT 13-COLUMN GOOGLE SHEETS FORMAT:
+    # symbol | side | entry | exit | pips | profit | lot_size |
+    # entry_signal | exit_signal | entry_time_bangkok |
+    # exit_time_bangkok | trade_duration | exit_reason
+
+    row = [
+        symbol,
+        side,
+        round(entry_price, 5),
+        round(exit_price, 5),
+        pips,
+        profit,
+        LOT_SIZE,
+        trade["entry_signal"],
+        exit_signal,
+        trade["entry_time"],
+        fmt_bangkok(exit_dt),
+        trade_duration(trade["entry_dt"], exit_dt),
+        exit_reason
+    ]
+
+    sheet_written = write_trade_to_sheet(row)
+
+    print(f"CLOSED {symbol} {side} | {exit_signal} | {pips} pips")
+
+    del current_trades[symbol]
+
+    return {
+        "status": "closed",
+        "symbol": symbol,
+        "side": side,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "pips": pips,
+        "profit": profit,
+        "exit_signal": exit_signal,
+        "exit_reason": exit_reason,
+        "sheet_written": sheet_written
+    }
+
+
 # =========================
-# WEBHOOK
+# ROUTES
 # =========================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Trading bot is running."
+    return jsonify({
+        "status": "running",
+        "service": "tradingview-bot",
+        "stop_loss_pips": STOP_LOSS_PIPS,
+        "take_profit_pips": TAKE_PROFIT_PIPS,
+        "lot_size": LOT_SIZE,
+        "open_trades": current_trades
+    })
 
 
 @app.route("/", methods=["POST"])
@@ -212,15 +263,16 @@ def webhook():
     data = request.json or {}
 
     if data.get("secret") != SECRET:
+        print("Unauthorized request")
         return jsonify({"status": "unauthorized"}), 401
 
-    symbol = data.get("symbol", "").upper()
-    action = data.get("action", "").lower()
-    signal = data.get("signal", "").lower()
+    symbol = str(data.get("symbol", "")).upper().strip()
+    action = str(data.get("action", "")).lower().strip()
+    signal = str(data.get("signal", "")).lower().strip()
 
     try:
         price = float(data.get("price"))
-    except:
+    except Exception:
         return jsonify({
             "status": "error",
             "reason": "missing or invalid price",
@@ -242,11 +294,16 @@ def webhook():
     if symbol in current_trades:
         trade = current_trades[symbol]
 
-        hard_exit_reason, hard_exit_price = check_hard_exit(trade, price)
+        hard_exit_signal, hard_exit_reason, hard_exit_price = check_hard_exit(trade, price)
 
-        if hard_exit_reason:
+        if hard_exit_signal:
             return jsonify(
-                close_trade(symbol, hard_exit_price, hard_exit_reason)
+                close_trade(
+                    symbol=symbol,
+                    exit_price=hard_exit_price,
+                    exit_signal=hard_exit_signal,
+                    exit_reason=hard_exit_reason
+                )
             )
 
     # =========================
@@ -258,12 +315,22 @@ def webhook():
 
         if trade["side"] == "buy" and signal in ["exit_buy", "bot_exit_buy"]:
             return jsonify(
-                close_trade(symbol, price, "indicator_exit_buy")
+                close_trade(
+                    symbol=symbol,
+                    exit_price=price,
+                    exit_signal="exit_buy",
+                    exit_reason="indicator_exit"
+                )
             )
 
         if trade["side"] == "sell" and signal in ["exit_sell", "bot_exit_sell"]:
             return jsonify(
-                close_trade(symbol, price, "indicator_exit_sell")
+                close_trade(
+                    symbol=symbol,
+                    exit_price=price,
+                    exit_signal="exit_sell",
+                    exit_reason="indicator_exit"
+                )
             )
 
     # =========================
@@ -309,5 +376,7 @@ def webhook():
 # =========================
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", 8080))
+    print("Starting tradingview-bot...")
+    print(f"Listening on port {port}")
     app.run(host="0.0.0.0", port=port)
