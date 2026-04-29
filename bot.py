@@ -397,4 +397,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     print("Starting tradingview-bot...")
     print(f"Listening on port {port}")
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port) 
