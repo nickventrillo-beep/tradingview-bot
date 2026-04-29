@@ -14,16 +14,14 @@ current_trades = {}
 SECRET = os.getenv("WEBHOOK_SECRET", "chidrew1")
 
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1000"))
-STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "5"))
-TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "7"))
+STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "4"))
+TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "8"))
 
-MIN_ADX = float(os.getenv("MIN_ADX", "20"))
-MIN_DI_GAP = float(os.getenv("MIN_DI_GAP", "7"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "70"))
+MIN_ADX = float(os.getenv("MIN_ADX", "25"))
+MIN_DI_GAP = float(os.getenv("MIN_DI_GAP", "10"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "80"))
 
 ALLOW_PULLBACKS = os.getenv("ALLOW_PULLBACKS", "false").lower() == "true"
-IGNORE_PROFITABLE_INDICATOR_EXIT = os.getenv("IGNORE_PROFITABLE_INDICATOR_EXIT", "true").lower() == "true"
-
 GOOGLE_SHEET_WEBAPP_URL = os.getenv("GOOGLE_SHEET_WEBAPP_URL", "")
 
 EMAIL_ON_CLOSE = os.getenv("EMAIL_ON_CLOSE", "true").lower() == "true"
@@ -68,6 +66,38 @@ def calc_pips(symbol, side, entry, exit_price):
 
 def calc_profit(pips):
     return round((pips * LOT_SIZE) / 10000, 2)
+
+
+def correct_exit_signal(side, exit_reason):
+    if exit_reason == "stop_loss":
+        return "stop_loss_buy" if side == "buy" else "stop_loss_sell"
+    if exit_reason == "take_profit":
+        return "take_profit_buy" if side == "buy" else "take_profit_sell"
+    return "exit_buy" if side == "buy" else "exit_sell"
+
+
+def price_hit_stop_or_target(trade, price=None, high=None, low=None):
+    side = trade["side"]
+    stop_loss = trade["stop_loss"]
+    take_profit = trade["take_profit"]
+
+    if price is not None:
+        high = price if high is None else high
+        low = price if low is None else low
+
+    if side == "buy":
+        if low <= stop_loss:
+            return "stop_loss", stop_loss
+        if high >= take_profit:
+            return "take_profit", take_profit
+
+    if side == "sell":
+        if high >= stop_loss:
+            return "stop_loss", stop_loss
+        if low <= take_profit:
+            return "take_profit", take_profit
+
+    return None, None
 
 
 def send_close_email(row):
@@ -143,7 +173,7 @@ def send_to_google_sheet(row):
         return False
 
 
-def close_trade(symbol, exit_price, exit_signal, exit_reason):
+def close_trade(symbol, exit_price, exit_reason):
     symbol = symbol.upper()
 
     if symbol not in current_trades:
@@ -155,6 +185,7 @@ def close_trade(symbol, exit_price, exit_signal, exit_reason):
     entry = trade["entry"]
     entry_time_dt = trade["entry_time_dt"]
 
+    exit_signal = correct_exit_signal(side, exit_reason)
     pips = calc_pips(symbol, side, entry, exit_price)
     profit = calc_profit(pips)
 
@@ -316,15 +347,15 @@ def webhook():
 
         if side == "buy":
             if low <= trade["stop_loss"]:
-                return close_trade(symbol, trade["stop_loss"], "stop_loss_buy", "stop_loss")
+                return close_trade(symbol, trade["stop_loss"], "stop_loss")
             if high >= trade["take_profit"]:
-                return close_trade(symbol, trade["take_profit"], "take_profit_buy", "take_profit")
+                return close_trade(symbol, trade["take_profit"], "take_profit")
 
         if side == "sell":
             if high >= trade["stop_loss"]:
-                return close_trade(symbol, trade["stop_loss"], "stop_loss_sell", "stop_loss")
+                return close_trade(symbol, trade["stop_loss"], "stop_loss")
             if low <= trade["take_profit"]:
-                return close_trade(symbol, trade["take_profit"], "take_profit_sell", "take_profit")
+                return close_trade(symbol, trade["take_profit"], "take_profit")
 
         return {"status": "updated", "reason": "no_exit"}
 
@@ -333,17 +364,31 @@ def webhook():
             return {"status": "ignored", "reason": "no_open_trade"}
 
         trade = current_trades[symbol]
-        current_pips = calc_pips(symbol, trade["side"], trade["entry"], price)
 
-        if reason == "indicator_exit" and IGNORE_PROFITABLE_INDICATOR_EXIT and current_pips > 0:
-            print(f"IGNORED PROFITABLE INDICATOR EXIT: {symbol} {current_pips} pips")
+        # Safety check: even if this is an indicator exit, never allow
+        # the trade to close worse than the configured bot stop loss.
+        exit_reason, exit_price = price_hit_stop_or_target(trade, price=price)
+        if exit_reason == "stop_loss":
+            print(f"FORCED STOP FROM EXIT ALERT: {symbol} {trade['side']} at SL={exit_price}")
+            return close_trade(symbol, exit_price, "stop_loss")
+        if exit_reason == "take_profit":
+            print(f"FORCED TP FROM EXIT ALERT: {symbol} {trade['side']} at TP={exit_price}")
+            return close_trade(symbol, exit_price, "take_profit")
+
+        # Trend-follower mode: ignore indicator exits completely.
+        # Trades only close by stop loss or take profit.
+        if reason == "indicator_exit" or signal in ["exit_buy", "exit_sell"]:
+            current_pips = calc_pips(symbol, trade["side"], trade["entry"], price)
+            print(f"IGNORED INDICATOR EXIT: {symbol} {trade['side']} | {current_pips} pips")
             return {
                 "status": "ignored_exit",
-                "reason": "let_winner_run",
+                "reason": "indicator_exits_disabled",
                 "current_pips": current_pips
             }
 
-        return close_trade(symbol, price, signal, reason)
+        # Manual or non-indicator exits are still allowed, but the exit
+        # signal written to Google Sheets is forced to match the trade side.
+        return close_trade(symbol, price, "manual_exit")
 
     return {"status": "ignored", "reason": "unknown_action"}
 
