@@ -1,5 +1,4 @@
 import os
-import json
 import smtplib
 import requests
 from datetime import datetime, timezone, timedelta
@@ -15,13 +14,25 @@ SECRET = os.getenv("WEBHOOK_SECRET", "chidrew1")
 
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1000"))
 STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "4"))
-TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "8"))
+TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "4"))
 
-MIN_ADX = float(os.getenv("MIN_ADX", "25"))
-MIN_DI_GAP = float(os.getenv("MIN_DI_GAP", "10"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "80"))
+# Earlier-entry settings for high-win-rate small grabs
+MIN_ADX = float(os.getenv("MIN_ADX", "18"))
+MIN_DI_GAP = float(os.getenv("MIN_DI_GAP", "5"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "60"))
+ALLOW_PULLBACKS = os.getenv("ALLOW_PULLBACKS", "true").lower() == "true"
 
-ALLOW_PULLBACKS = os.getenv("ALLOW_PULLBACKS", "false").lower() == "true"
+# Profit protection / early-exit settings
+USE_PROFIT_PROTECTION = os.getenv("USE_PROFIT_PROTECTION", "true").lower() == "true"
+BREAKEVEN_TRIGGER_PIPS = float(os.getenv("BREAKEVEN_TRIGGER_PIPS", "2"))
+LOCK_PROFIT_TRIGGER_PIPS = float(os.getenv("LOCK_PROFIT_TRIGGER_PIPS", "3"))
+LOCK_PROFIT_PIPS = float(os.getenv("LOCK_PROFIT_PIPS", "1"))
+
+# Indicator exits now act as early exits, but only when useful.
+ALLOW_INDICATOR_EXITS = os.getenv("ALLOW_INDICATOR_EXITS", "true").lower() == "true"
+INDICATOR_EXIT_MIN_PROFIT_PIPS = float(os.getenv("INDICATOR_EXIT_MIN_PROFIT_PIPS", "1"))
+INDICATOR_EXIT_MAX_LOSS_PIPS = float(os.getenv("INDICATOR_EXIT_MAX_LOSS_PIPS", "2"))
+
 GOOGLE_SHEET_WEBAPP_URL = os.getenv("GOOGLE_SHEET_WEBAPP_URL", "")
 
 EMAIL_ON_CLOSE = os.getenv("EMAIL_ON_CLOSE", "true").lower() == "true"
@@ -57,6 +68,10 @@ def pips_to_price(symbol, pips):
     return pips * pip_size(symbol)
 
 
+def round_price(symbol, price):
+    return round(price, 3 if "JPY" in symbol.upper() else 5)
+
+
 def calc_pips(symbol, side, entry, exit_price):
     ps = pip_size(symbol)
     if side == "buy":
@@ -87,17 +102,53 @@ def price_hit_stop_or_target(trade, price=None, high=None, low=None):
 
     if side == "buy":
         if low <= stop_loss:
-            return "stop_loss", stop_loss
+            reason = trade.get("stop_reason", "stop_loss")
+            return reason, stop_loss
         if high >= take_profit:
             return "take_profit", take_profit
 
     if side == "sell":
         if high >= stop_loss:
-            return "stop_loss", stop_loss
+            reason = trade.get("stop_reason", "stop_loss")
+            return reason, stop_loss
         if low <= take_profit:
             return "take_profit", take_profit
 
     return None, None
+
+
+def best_open_profit_pips(symbol, trade, high, low):
+    if trade["side"] == "buy":
+        return calc_pips(symbol, "buy", trade["entry"], high)
+    return calc_pips(symbol, "sell", trade["entry"], low)
+
+
+def update_profit_protection(symbol, trade, high, low):
+    if not USE_PROFIT_PROTECTION:
+        return
+
+    side = trade["side"]
+    entry = trade["entry"]
+    best_pips = best_open_profit_pips(symbol, trade, high, low)
+
+    # Stage 1: at +2 pips, move stop to break-even.
+    if best_pips >= BREAKEVEN_TRIGGER_PIPS and not trade.get("breakeven_done", False):
+        trade["stop_loss"] = round_price(symbol, entry)
+        trade["stop_reason"] = "breakeven_exit"
+        trade["breakeven_done"] = True
+        print(f"PROTECT {symbol}: moved stop to breakeven at {trade['stop_loss']}")
+
+    # Stage 2: at +3 pips, lock +1 pip.
+    if best_pips >= LOCK_PROFIT_TRIGGER_PIPS and not trade.get("lock_done", False):
+        if side == "buy":
+            new_stop = entry + pips_to_price(symbol, LOCK_PROFIT_PIPS)
+        else:
+            new_stop = entry - pips_to_price(symbol, LOCK_PROFIT_PIPS)
+
+        trade["stop_loss"] = round_price(symbol, new_stop)
+        trade["stop_reason"] = "locked_profit_exit"
+        trade["lock_done"] = True
+        print(f"PROTECT {symbol}: locked +{LOCK_PROFIT_PIPS} pip at stop {trade['stop_loss']}")
 
 
 def send_close_email(row):
@@ -185,6 +236,7 @@ def close_trade(symbol, exit_price, exit_reason):
     entry = trade["entry"]
     entry_time_dt = trade["entry_time_dt"]
 
+    exit_price = round_price(symbol, exit_price)
     exit_signal = correct_exit_signal(side, exit_reason)
     pips = calc_pips(symbol, side, entry, exit_price)
     profit = calc_profit(pips)
@@ -215,7 +267,7 @@ def close_trade(symbol, exit_price, exit_reason):
 
     del current_trades[symbol]
 
-    print(f"CLOSED {symbol} {side} | {exit_signal} | {pips} pips")
+    print(f"CLOSED {symbol} {side} | {exit_signal} | {pips} pips | reason={exit_reason}")
 
     return {
         "status": "closed",
@@ -268,7 +320,23 @@ def health():
     return {
         "status": "running",
         "open_trades": list(current_trades.keys()),
-        "bangkok_time": now_bangkok()
+        "bangkok_time": now_bangkok(),
+        "settings": {
+            "lot_size": LOT_SIZE,
+            "stop_loss_pips": STOP_LOSS_PIPS,
+            "take_profit_pips": TAKE_PROFIT_PIPS,
+            "min_adx": MIN_ADX,
+            "min_di_gap": MIN_DI_GAP,
+            "min_score": MIN_SCORE,
+            "allow_pullbacks": ALLOW_PULLBACKS,
+            "use_profit_protection": USE_PROFIT_PROTECTION,
+            "breakeven_trigger_pips": BREAKEVEN_TRIGGER_PIPS,
+            "lock_profit_trigger_pips": LOCK_PROFIT_TRIGGER_PIPS,
+            "lock_profit_pips": LOCK_PROFIT_PIPS,
+            "allow_indicator_exits": ALLOW_INDICATOR_EXITS,
+            "indicator_exit_min_profit_pips": INDICATOR_EXIT_MIN_PROFIT_PIPS,
+            "indicator_exit_max_loss_pips": INDICATOR_EXIT_MAX_LOSS_PIPS
+        }
     }
 
 
@@ -304,14 +372,12 @@ def webhook():
             print(f"FILTERED {symbol} {action} {signal}: {filter_reason}")
             return {"status": "filtered", "reason": filter_reason}
 
-        ps = pip_size(symbol)
-
         if action == "buy":
-            stop_loss = round(price - pips_to_price(symbol, STOP_LOSS_PIPS), 5)
-            take_profit = round(price + pips_to_price(symbol, TAKE_PROFIT_PIPS), 5)
+            stop_loss = round_price(symbol, price - pips_to_price(symbol, STOP_LOSS_PIPS))
+            take_profit = round_price(symbol, price + pips_to_price(symbol, TAKE_PROFIT_PIPS))
         else:
-            stop_loss = round(price + pips_to_price(symbol, STOP_LOSS_PIPS), 5)
-            take_profit = round(price - pips_to_price(symbol, TAKE_PROFIT_PIPS), 5)
+            stop_loss = round_price(symbol, price + pips_to_price(symbol, STOP_LOSS_PIPS))
+            take_profit = round_price(symbol, price - pips_to_price(symbol, TAKE_PROFIT_PIPS))
 
         current_trades[symbol] = {
             "symbol": symbol,
@@ -319,6 +385,9 @@ def webhook():
             "entry": price,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+            "stop_reason": "stop_loss",
+            "breakeven_done": False,
+            "lock_done": False,
             "entry_signal": signal,
             "entry_time": parse_alert_time(data.get("time")),
             "entry_time_dt": datetime.now(BANGKOK_TZ)
@@ -340,24 +409,30 @@ def webhook():
             return {"status": "ignored", "reason": "no_open_trade"}
 
         trade = current_trades[symbol]
-        side = trade["side"]
 
         high = float(data.get("high", price))
         low = float(data.get("low", price))
 
-        if side == "buy":
-            if low <= trade["stop_loss"]:
-                return close_trade(symbol, trade["stop_loss"], "stop_loss")
-            if high >= trade["take_profit"]:
-                return close_trade(symbol, trade["take_profit"], "take_profit")
+        # First check whether original/current stop or TP was hit.
+        exit_reason, exit_price = price_hit_stop_or_target(trade, high=high, low=low)
+        if exit_reason:
+            return close_trade(symbol, exit_price, exit_reason)
 
-        if side == "sell":
-            if high >= trade["stop_loss"]:
-                return close_trade(symbol, trade["stop_loss"], "stop_loss")
-            if low <= trade["take_profit"]:
-                return close_trade(symbol, trade["take_profit"], "take_profit")
+        # Then update protection stop based on the candle's best open profit.
+        update_profit_protection(symbol, trade, high, low)
 
-        return {"status": "updated", "reason": "no_exit"}
+        # Then check again in case the same candle both reached profit protection
+        # and reversed back through the new protected stop.
+        exit_reason, exit_price = price_hit_stop_or_target(trade, high=high, low=low)
+        if exit_reason:
+            return close_trade(symbol, exit_price, exit_reason)
+
+        return {
+            "status": "updated",
+            "reason": "no_exit",
+            "stop_loss": trade["stop_loss"],
+            "take_profit": trade["take_profit"]
+        }
 
     if action == "exit":
         if symbol not in current_trades:
@@ -365,29 +440,40 @@ def webhook():
 
         trade = current_trades[symbol]
 
-        # Safety check: even if this is an indicator exit, never allow
-        # the trade to close worse than the configured bot stop loss.
+        # Safety check: never allow an exit alert to close worse than the active bot stop.
         exit_reason, exit_price = price_hit_stop_or_target(trade, price=price)
-        if exit_reason == "stop_loss":
-            print(f"FORCED STOP FROM EXIT ALERT: {symbol} {trade['side']} at SL={exit_price}")
-            return close_trade(symbol, exit_price, "stop_loss")
-        if exit_reason == "take_profit":
-            print(f"FORCED TP FROM EXIT ALERT: {symbol} {trade['side']} at TP={exit_price}")
-            return close_trade(symbol, exit_price, "take_profit")
+        if exit_reason:
+            print(f"FORCED EXIT FROM EXIT ALERT: {symbol} {trade['side']} at {exit_price} reason={exit_reason}")
+            return close_trade(symbol, exit_price, exit_reason)
 
-        # Trend-follower mode: ignore indicator exits completely.
-        # Trades only close by stop loss or take profit.
         if reason == "indicator_exit" or signal in ["exit_buy", "exit_sell"]:
             current_pips = calc_pips(symbol, trade["side"], trade["entry"], price)
-            print(f"IGNORED INDICATOR EXIT: {symbol} {trade['side']} | {current_pips} pips")
+
+            if not ALLOW_INDICATOR_EXITS:
+                print(f"IGNORED INDICATOR EXIT: {symbol} {trade['side']} | {current_pips} pips")
+                return {
+                    "status": "ignored_exit",
+                    "reason": "indicator_exits_disabled",
+                    "current_pips": current_pips
+                }
+
+            # Lock small profits when the indicator says momentum faded.
+            if current_pips >= INDICATOR_EXIT_MIN_PROFIT_PIPS:
+                print(f"EARLY PROFIT EXIT: {symbol} {trade['side']} | {current_pips} pips")
+                return close_trade(symbol, price, "early_profit_exit")
+
+            # Cut bad trades early instead of always waiting for full SL.
+            if current_pips <= -INDICATOR_EXIT_MAX_LOSS_PIPS:
+                print(f"EARLY LOSS EXIT: {symbol} {trade['side']} | {current_pips} pips")
+                return close_trade(symbol, price, "early_loss_exit")
+
+            print(f"IGNORED SMALL INDICATOR EXIT: {symbol} {trade['side']} | {current_pips} pips")
             return {
                 "status": "ignored_exit",
-                "reason": "indicator_exits_disabled",
+                "reason": "indicator_exit_too_small",
                 "current_pips": current_pips
             }
 
-        # Manual or non-indicator exits are still allowed, but the exit
-        # signal written to Google Sheets is forced to match the trade side.
         return close_trade(symbol, price, "manual_exit")
 
     return {"status": "ignored", "reason": "unknown_action"}
@@ -397,4 +483,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     print("Starting tradingview-bot...")
     print(f"Listening on port {port}")
-    app.run(host="0.0.0.0", port=port) 
+    app.run(host="0.0.0.0", port=port)
