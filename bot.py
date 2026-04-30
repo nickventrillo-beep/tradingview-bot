@@ -8,7 +8,12 @@ from flask import Flask, request
 app = Flask(__name__)
 
 BANGKOK_TZ = timezone(timedelta(hours=7))
+
+# Open trades are stored in memory by symbol.
 current_trades = {}
+
+# Prevent duplicate close/write when multiple TradingView alerts hit at the same time.
+closing_trades = set()
 
 SECRET = os.getenv("WEBHOOK_SECRET", "chidrew1")
 
@@ -16,7 +21,7 @@ LOT_SIZE = float(os.getenv("LOT_SIZE", "1000"))
 STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "4"))
 TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "4"))
 
-# Earlier-entry settings for high-win-rate small grabs
+# Entry filters
 MIN_ADX = float(os.getenv("MIN_ADX", "18"))
 MIN_DI_GAP = float(os.getenv("MIN_DI_GAP", "5"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "60"))
@@ -28,7 +33,7 @@ BREAKEVEN_TRIGGER_PIPS = float(os.getenv("BREAKEVEN_TRIGGER_PIPS", "2"))
 LOCK_PROFIT_TRIGGER_PIPS = float(os.getenv("LOCK_PROFIT_TRIGGER_PIPS", "3"))
 LOCK_PROFIT_PIPS = float(os.getenv("LOCK_PROFIT_PIPS", "1"))
 
-# Indicator exits now act as early exits, but only when useful.
+# Indicator exits act as early exits, but only when useful.
 ALLOW_INDICATOR_EXITS = os.getenv("ALLOW_INDICATOR_EXITS", "true").lower() == "true"
 INDICATOR_EXIT_MIN_PROFIT_PIPS = float(os.getenv("INDICATOR_EXIT_MIN_PROFIT_PIPS", "1"))
 INDICATOR_EXIT_MAX_LOSS_PIPS = float(os.getenv("INDICATOR_EXIT_MAX_LOSS_PIPS", "2"))
@@ -88,6 +93,14 @@ def correct_exit_signal(side, exit_reason):
         return "stop_loss_buy" if side == "buy" else "stop_loss_sell"
     if exit_reason == "take_profit":
         return "take_profit_buy" if side == "buy" else "take_profit_sell"
+    if exit_reason == "breakeven_exit":
+        return "breakeven_exit_buy" if side == "buy" else "breakeven_exit_sell"
+    if exit_reason == "locked_profit_exit":
+        return "locked_profit_exit_buy" if side == "buy" else "locked_profit_exit_sell"
+    if exit_reason == "early_profit_exit":
+        return "early_profit_exit_buy" if side == "buy" else "early_profit_exit_sell"
+    if exit_reason == "early_loss_exit":
+        return "early_loss_exit_buy" if side == "buy" else "early_loss_exit_sell"
     return "exit_buy" if side == "buy" else "exit_sell"
 
 
@@ -131,14 +144,14 @@ def update_profit_protection(symbol, trade, high, low):
     entry = trade["entry"]
     best_pips = best_open_profit_pips(symbol, trade, high, low)
 
-    # Stage 1: at +2 pips, move stop to break-even.
+    # Stage 1: move stop to breakeven once the trade has moved in your favor.
     if best_pips >= BREAKEVEN_TRIGGER_PIPS and not trade.get("breakeven_done", False):
         trade["stop_loss"] = round_price(symbol, entry)
         trade["stop_reason"] = "breakeven_exit"
         trade["breakeven_done"] = True
         print(f"PROTECT {symbol}: moved stop to breakeven at {trade['stop_loss']}")
 
-    # Stage 2: at +3 pips, lock +1 pip.
+    # Stage 2: lock profit once the trade moves further in your favor.
     if best_pips >= LOCK_PROFIT_TRIGGER_PIPS and not trade.get("lock_done", False):
         if side == "buy":
             new_stop = entry + pips_to_price(symbol, LOCK_PROFIT_PIPS)
@@ -227,56 +240,67 @@ def send_to_google_sheet(row):
 def close_trade(symbol, exit_price, exit_reason):
     symbol = symbol.upper()
 
+    # Prevent duplicate closes/writes when multiple alerts hit together.
+    if symbol in closing_trades:
+        print(f"SKIPPED DUPLICATE CLOSE: {symbol}")
+        return {"status": "ignored", "reason": "already_closing"}
+
     if symbol not in current_trades:
         return {"status": "ignored", "reason": "no_open_trade"}
 
-    trade = current_trades[symbol]
+    closing_trades.add(symbol)
 
-    side = trade["side"]
-    entry = trade["entry"]
-    entry_time_dt = trade["entry_time_dt"]
+    try:
+        trade = current_trades[symbol]
 
-    exit_price = round_price(symbol, exit_price)
-    exit_signal = correct_exit_signal(side, exit_reason)
-    pips = calc_pips(symbol, side, entry, exit_price)
-    profit = calc_profit(pips)
+        side = trade["side"]
+        entry = trade["entry"]
+        entry_time_dt = trade["entry_time_dt"]
 
-    exit_time_dt = datetime.now(BANGKOK_TZ)
-    duration = str(exit_time_dt - entry_time_dt).split(".")[0]
+        exit_price = round_price(symbol, exit_price)
+        exit_signal = correct_exit_signal(side, exit_reason)
+        pips = calc_pips(symbol, side, entry, exit_price)
+        profit = calc_profit(pips)
 
-    row = [
-        symbol,
-        side,
-        entry,
-        exit_price,
-        pips,
-        profit,
-        LOT_SIZE,
-        trade["entry_signal"],
-        exit_signal,
-        entry_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        exit_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        duration,
-        exit_reason
-    ]
+        exit_time_dt = datetime.now(BANGKOK_TZ)
+        duration = str(exit_time_dt - entry_time_dt).split(".")[0]
 
-    written = send_to_google_sheet(row)
+        row = [
+            symbol,
+            side,
+            entry,
+            exit_price,
+            pips,
+            profit,
+            LOT_SIZE,
+            trade["entry_signal"],
+            exit_signal,
+            entry_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            exit_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            duration,
+            exit_reason
+        ]
 
-    if written:
-        send_close_email(row)
+        written = send_to_google_sheet(row)
 
-    current_trades.pop(symbol, None)
+        if written:
+            send_close_email(row)
 
-    print(f"CLOSED {symbol} {side} | {exit_signal} | {pips} pips | reason={exit_reason}")
+        current_trades.pop(symbol, None)
 
-    return {
-        "status": "closed",
-        "symbol": symbol,
-        "side": side,
-        "pips": pips,
-        "profit": profit,
-        "exit_reason": exit_reason
-    }
+        print(f"CLOSED {symbol} {side} | {exit_signal} | {pips} pips | reason={exit_reason}")
+
+        return {
+            "status": "closed",
+            "symbol": symbol,
+            "side": side,
+            "pips": pips,
+            "profit": profit,
+            "exit_reason": exit_reason
+        }
+
+    finally:
+        closing_trades.discard(symbol)
 
 
 def passes_entry_filters(data):
@@ -320,6 +344,7 @@ def health():
     return {
         "status": "running",
         "open_trades": list(current_trades.keys()),
+        "closing_trades": list(closing_trades),
         "bangkok_time": now_bangkok(),
         "settings": {
             "lot_size": LOT_SIZE,
@@ -363,8 +388,8 @@ def webhook():
         return {"status": "ignored", "reason": "bad_price"}
 
     if action in ["buy", "sell"]:
-        if symbol in current_trades:
-            return {"status": "ignored", "reason": "trade_already_open"}
+        if symbol in current_trades or symbol in closing_trades:
+            return {"status": "ignored", "reason": "trade_already_open_or_closing"}
 
         passed, filter_reason = passes_entry_filters(data)
 
@@ -408,10 +433,16 @@ def webhook():
         if symbol not in current_trades:
             return {"status": "ignored", "reason": "no_open_trade"}
 
+        if symbol in closing_trades:
+            return {"status": "ignored", "reason": "already_closing"}
+
         trade = current_trades[symbol]
 
-        high = float(data.get("high", price))
-        low = float(data.get("low", price))
+        try:
+            high = float(data.get("high", price))
+            low = float(data.get("low", price))
+        except Exception:
+            return {"status": "ignored", "reason": "bad_high_low"}
 
         # First check whether original/current stop or TP was hit.
         exit_reason, exit_price = price_hit_stop_or_target(trade, high=high, low=low)
@@ -437,6 +468,10 @@ def webhook():
     if action == "exit":
         if symbol not in current_trades:
             return {"status": "ignored", "reason": "no_open_trade"}
+
+        if symbol in closing_trades:
+            print(f"SKIPPED DUPLICATE EXIT ALERT: {symbol}")
+            return {"status": "ignored", "reason": "already_closing"}
 
         trade = current_trades[symbol]
 
