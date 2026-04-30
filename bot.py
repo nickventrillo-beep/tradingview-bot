@@ -265,7 +265,7 @@ def close_trade(symbol, exit_price, exit_reason):
     if written:
         send_close_email(row)
 
-    del current_trades[symbol]
+    current_trades.pop(symbol, None)
 
     print(f"CLOSED {symbol} {side} | {exit_signal} | {pips} pips | reason={exit_reason}")
 
