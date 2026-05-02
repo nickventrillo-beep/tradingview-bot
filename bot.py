@@ -18,23 +18,27 @@ closing_trades = set()
 SECRET = os.getenv("WEBHOOK_SECRET", "chidrew1")
 
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1000"))
-STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "4"))
-TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "4"))
+STOP_LOSS_PIPS = float(os.getenv("STOP_LOSS_PIPS", "5"))
+TAKE_PROFIT_PIPS = float(os.getenv("TAKE_PROFIT_PIPS", "12"))
 
 # Entry filters
-MIN_ADX = float(os.getenv("MIN_ADX", "18"))
-MIN_DI_GAP = float(os.getenv("MIN_DI_GAP", "5"))
-MIN_SCORE = float(os.getenv("MIN_SCORE", "60"))
+MIN_ADX = float(os.getenv("MIN_ADX", "15"))
+MIN_DI_GAP = float(os.getenv("MIN_DI_GAP", "3"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "50"))
 ALLOW_PULLBACKS = os.getenv("ALLOW_PULLBACKS", "true").lower() == "true"
 
 # Profit protection / early-exit settings
 USE_PROFIT_PROTECTION = os.getenv("USE_PROFIT_PROTECTION", "true").lower() == "true"
-BREAKEVEN_TRIGGER_PIPS = float(os.getenv("BREAKEVEN_TRIGGER_PIPS", "2"))
-LOCK_PROFIT_TRIGGER_PIPS = float(os.getenv("LOCK_PROFIT_TRIGGER_PIPS", "3"))
-LOCK_PROFIT_PIPS = float(os.getenv("LOCK_PROFIT_PIPS", "1"))
+BREAKEVEN_TRIGGER_PIPS = float(os.getenv("BREAKEVEN_TRIGGER_PIPS", "4"))
+LOCK_PROFIT_TRIGGER_PIPS = float(os.getenv("LOCK_PROFIT_TRIGGER_PIPS", "8"))
+LOCK_PROFIT_PIPS = float(os.getenv("LOCK_PROFIT_PIPS", "3"))
+
+# Hard early-loss protection: cuts losers before full SL, without relying on indicator exits.
+USE_EARLY_LOSS_EXIT = os.getenv("USE_EARLY_LOSS_EXIT", "true").lower() == "true"
+EARLY_LOSS_EXIT_PIPS = float(os.getenv("EARLY_LOSS_EXIT_PIPS", "3"))
 
 # Indicator exits act as early exits, but only when useful.
-ALLOW_INDICATOR_EXITS = os.getenv("ALLOW_INDICATOR_EXITS", "true").lower() == "true"
+ALLOW_INDICATOR_EXITS = os.getenv("ALLOW_INDICATOR_EXITS", "false").lower() == "true"
 INDICATOR_EXIT_MIN_PROFIT_PIPS = float(os.getenv("INDICATOR_EXIT_MIN_PROFIT_PIPS", "1"))
 INDICATOR_EXIT_MAX_LOSS_PIPS = float(os.getenv("INDICATOR_EXIT_MAX_LOSS_PIPS", "2"))
 
@@ -126,6 +130,37 @@ def price_hit_stop_or_target(trade, price=None, high=None, low=None):
             return reason, stop_loss
         if low <= take_profit:
             return "take_profit", take_profit
+
+    return None, None
+
+
+def early_loss_exit_hit(symbol, trade, price=None, high=None, low=None):
+    """Return an early-loss exit when current price action moves too far against entry.
+
+    This is independent of TradingView indicator exits. It runs on normal price_update
+    alerts, so indicator exits can stay disabled while losers are still cut early.
+    """
+    if not USE_EARLY_LOSS_EXIT:
+        return None, None
+
+    side = trade["side"]
+    entry = trade["entry"]
+
+    if price is not None:
+        high = price if high is None else high
+        low = price if low is None else low
+
+    if side == "buy":
+        worst_pips = calc_pips(symbol, "buy", entry, low)
+        if worst_pips <= -EARLY_LOSS_EXIT_PIPS:
+            exit_price = round_price(symbol, entry - pips_to_price(symbol, EARLY_LOSS_EXIT_PIPS))
+            return "early_loss_exit", exit_price
+
+    if side == "sell":
+        worst_pips = calc_pips(symbol, "sell", entry, high)
+        if worst_pips <= -EARLY_LOSS_EXIT_PIPS:
+            exit_price = round_price(symbol, entry + pips_to_price(symbol, EARLY_LOSS_EXIT_PIPS))
+            return "early_loss_exit", exit_price
 
     return None, None
 
@@ -358,6 +393,8 @@ def health():
             "breakeven_trigger_pips": BREAKEVEN_TRIGGER_PIPS,
             "lock_profit_trigger_pips": LOCK_PROFIT_TRIGGER_PIPS,
             "lock_profit_pips": LOCK_PROFIT_PIPS,
+            "use_early_loss_exit": USE_EARLY_LOSS_EXIT,
+            "early_loss_exit_pips": EARLY_LOSS_EXIT_PIPS,
             "allow_indicator_exits": ALLOW_INDICATOR_EXITS,
             "indicator_exit_min_profit_pips": INDICATOR_EXIT_MIN_PROFIT_PIPS,
             "indicator_exit_max_loss_pips": INDICATOR_EXIT_MAX_LOSS_PIPS
@@ -449,6 +486,12 @@ def webhook():
         if exit_reason:
             return close_trade(symbol, exit_price, exit_reason)
 
+        # Cut bad trades early before waiting for full SL. This does NOT depend on indicator exits.
+        exit_reason, exit_price = early_loss_exit_hit(symbol, trade, high=high, low=low)
+        if exit_reason:
+            print(f"EARLY LOSS EXIT FROM PRICE UPDATE: {symbol} {trade['side']} at {exit_price}")
+            return close_trade(symbol, exit_price, exit_reason)
+
         # Then update protection stop based on the candle's best open profit.
         update_profit_protection(symbol, trade, high, low)
 
@@ -479,6 +522,12 @@ def webhook():
         exit_reason, exit_price = price_hit_stop_or_target(trade, price=price)
         if exit_reason:
             print(f"FORCED EXIT FROM EXIT ALERT: {symbol} {trade['side']} at {exit_price} reason={exit_reason}")
+            return close_trade(symbol, exit_price, exit_reason)
+
+        # Even with indicator exits disabled, an exit alert can still trigger hard early-loss protection.
+        exit_reason, exit_price = early_loss_exit_hit(symbol, trade, price=price)
+        if exit_reason:
+            print(f"EARLY LOSS EXIT FROM EXIT ALERT: {symbol} {trade['side']} at {exit_price}")
             return close_trade(symbol, exit_price, exit_reason)
 
         if reason == "indicator_exit" or signal in ["exit_buy", "exit_sell"]:
