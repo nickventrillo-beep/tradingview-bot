@@ -15,6 +15,9 @@ current_trades = {}
 # Prevent duplicate close/write when multiple TradingView alerts hit at the same time.
 closing_trades = set()
 
+# Tracks the last exit date written to Google Sheets so we can insert a blank spacer row between days.
+last_written_date = None
+
 SECRET = os.getenv("WEBHOOK_SECRET", "chidrew1")
 
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1000"))
@@ -71,6 +74,20 @@ def parse_alert_time(value):
         return dt.astimezone(BANGKOK_TZ).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return now_bangkok()
+
+
+def date_suffix(day):
+    if 11 <= day <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+
+def format_sheet_date(dt):
+    return dt.strftime(f"%B {dt.day}{date_suffix(dt.day)}, %Y")
+
+
+def format_sheet_time(dt):
+    return dt.strftime("%H:%M:%S")
 
 
 def pip_size(symbol):
@@ -272,7 +289,7 @@ def send_close_email(row):
         print("EMAIL SKIPPED: missing SMTP_USER, SMTP_PASSWORD, or EMAIL_TO")
         return
 
-    symbol, side, entry, exit_price, pips, profit, lot_size, entry_signal, exit_signal, entry_time, exit_time, duration, exit_reason = row
+    trade_date, symbol, side, entry, exit_price, pips, profit, lot_size, entry_signal, exit_signal, entry_time, exit_time, duration, exit_reason = row
 
     subject = f"Trade Closed: {symbol} {side.upper()} | {pips} pips"
 
@@ -291,6 +308,7 @@ Entry signal: {entry_signal}
 Exit signal: {exit_signal}
 Exit reason: {exit_reason}
 
+Trade date: {trade_date}
 Entry time Bangkok: {entry_time}
 Exit time Bangkok: {exit_time}
 Duration: {duration}
@@ -314,11 +332,31 @@ Duration: {duration}
 
 
 def send_to_google_sheet(row):
+    global last_written_date
+
     if not GOOGLE_SHEET_WEBAPP_URL:
         print("GOOGLE SHEET SKIPPED: missing GOOGLE_SHEET_WEBAPP_URL")
         return False
 
     try:
+        current_date = row[0]  # first column is the exit-date label, e.g. May 5th, 2026
+
+        # Insert a true blank spacer row before the first trade of a new exit-date.
+        # This uses the same number of columns as the trade row, but every cell is empty.
+        if last_written_date and current_date != last_written_date:
+            spacer_row = [""] * len(row)
+            spacer_response = requests.post(
+                GOOGLE_SHEET_WEBAPP_URL,
+                json={"row": spacer_row},
+                timeout=10
+            )
+
+            if spacer_response.status_code >= 400:
+                print(f"GOOGLE SHEET SPACER ROW ERROR: {spacer_response.status_code} {spacer_response.text}")
+                return False
+
+            print("Sent blank spacer row to Google Sheets")
+
         response = requests.post(
             GOOGLE_SHEET_WEBAPP_URL,
             json={"row": row},
@@ -328,6 +366,8 @@ def send_to_google_sheet(row):
         if response.status_code >= 400:
             print(f"GOOGLE SHEET ERROR: {response.status_code} {response.text}")
             return False
+
+        last_written_date = current_date
 
         print(f"Sent to Google Sheets: {row}")
         return True
@@ -365,7 +405,11 @@ def close_trade(symbol, exit_price, exit_reason):
         exit_time_dt = datetime.now(BANGKOK_TZ)
         duration = str(exit_time_dt - entry_time_dt).split(".")[0]
 
+        # Use EXIT timing for the reporting date, so daily profit/loss is grouped by the day the trade closed.
+        trade_date = format_sheet_date(exit_time_dt)
+
         row = [
+            trade_date,
             symbol,
             side,
             entry,
@@ -375,8 +419,8 @@ def close_trade(symbol, exit_price, exit_reason):
             LOT_SIZE,
             trade["entry_signal"],
             exit_signal,
-            entry_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            exit_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            format_sheet_time(entry_time_dt),
+            format_sheet_time(exit_time_dt),
             duration,
             exit_reason
         ]
