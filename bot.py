@@ -47,6 +47,22 @@ TRAIL_START_PIPS = float(os.getenv("TRAIL_START_PIPS", "8"))
 TRAIL_DISTANCE_PIPS = float(os.getenv("TRAIL_DISTANCE_PIPS", "5"))
 TRAIL_STEP_PIPS = float(os.getenv("TRAIL_STEP_PIPS", "1"))
 
+# News protection settings. TradingView can keep sending alerts, but the bot will refuse NEW entries
+# around scheduled news event times. Existing open trades are still managed normally.
+USE_NEWS_TIME_BLOCK = os.getenv("USE_NEWS_TIME_BLOCK", "false").lower() == "true"
+
+# Preferred setup: enter only the NEWS EVENT TIMES in Bangkok time, 24-hour clock.
+# Example: "19:30,21:00"
+# The bot automatically blocks from NEWS_BLOCK_BEFORE_MINUTES before each event
+# until NEWS_BLOCK_AFTER_MINUTES after each event.
+NEWS_EVENT_TIMES = os.getenv("NEWS_EVENT_TIMES", "")
+NEWS_BLOCK_BEFORE_MINUTES = int(os.getenv("NEWS_BLOCK_BEFORE_MINUTES", "15"))
+NEWS_BLOCK_AFTER_MINUTES = int(os.getenv("NEWS_BLOCK_AFTER_MINUTES", "30"))
+
+# Optional manual override: exact Bangkok-time windows. You can leave this blank.
+# Example: "15:15-16:00,19:15-20:00"
+NEWS_BLOCK_WINDOWS = os.getenv("NEWS_BLOCK_WINDOWS", "")
+
 # Indicator exits act as early exits, but only when useful.
 ALLOW_INDICATOR_EXITS = os.getenv("ALLOW_INDICATOR_EXITS", "false").lower() == "true"
 INDICATOR_EXIT_MIN_PROFIT_PIPS = float(os.getenv("INDICATOR_EXIT_MIN_PROFIT_PIPS", "1"))
@@ -89,6 +105,93 @@ def format_sheet_date(dt):
 def format_sheet_time(dt):
     return dt.strftime("%H:%M:%S")
 
+
+def parse_hhmm(value):
+    try:
+        hour_text, minute_text = value.strip().split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+    except Exception:
+        pass
+
+    return None
+
+
+def minutes_to_hhmm(total_minutes):
+    total_minutes = total_minutes % (24 * 60)
+    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+
+def is_minute_inside_window(now_minutes, start_minutes, end_minutes):
+    if start_minutes <= end_minutes:
+        return start_minutes <= now_minutes <= end_minutes
+
+    # Overnight window, e.g. 23:45-00:30
+    return now_minutes >= start_minutes or now_minutes <= end_minutes
+
+
+def active_news_block_window(now_dt=None):
+    """Return the active Bangkok-time news block window, or None if trading is allowed.
+
+    Preferred setup:
+        NEWS_EVENT_TIMES="19:30,21:00"
+        NEWS_BLOCK_BEFORE_MINUTES=15
+        NEWS_BLOCK_AFTER_MINUTES=30
+
+    With that example, a 19:30 event blocks new entries from 19:15 to 20:00.
+
+    Optional manual setup still works:
+        NEWS_BLOCK_WINDOWS="15:15-16:00,19:15-20:00"
+
+    This blocks NEW entries only. Existing trades are still updated and closed normally.
+    """
+    if not USE_NEWS_TIME_BLOCK:
+        return None
+
+    now_dt = now_dt or datetime.now(BANGKOK_TZ)
+    now_minutes = now_dt.hour * 60 + now_dt.minute
+
+    # 1) Preferred: event times. Example: NEWS_EVENT_TIMES="19:30,21:00"
+    event_times_text = (NEWS_EVENT_TIMES or "").strip()
+    if event_times_text:
+        for raw_event_time in event_times_text.split(","):
+            event_time_text = raw_event_time.strip()
+            if not event_time_text:
+                continue
+
+            event_minutes = parse_hhmm(event_time_text)
+            if event_minutes is None:
+                print(f"NEWS BLOCK CONFIG WARNING: bad event time '{event_time_text}'")
+                continue
+
+            start_minutes = event_minutes - NEWS_BLOCK_BEFORE_MINUTES
+            end_minutes = event_minutes + NEWS_BLOCK_AFTER_MINUTES
+
+            if is_minute_inside_window(now_minutes, start_minutes % (24 * 60), end_minutes % (24 * 60)):
+                return f"event {event_time_text} / block {minutes_to_hhmm(start_minutes)}-{minutes_to_hhmm(end_minutes)}"
+
+    # 2) Optional exact windows. Example: NEWS_BLOCK_WINDOWS="15:15-16:00,19:15-20:00"
+    windows_text = (NEWS_BLOCK_WINDOWS or "").strip()
+    if windows_text:
+        for raw_window in windows_text.split(","):
+            window = raw_window.strip()
+            if not window or "-" not in window:
+                continue
+
+            start_text, end_text = window.split("-", 1)
+            start_minutes = parse_hhmm(start_text)
+            end_minutes = parse_hhmm(end_text)
+
+            if start_minutes is None or end_minutes is None:
+                print(f"NEWS BLOCK CONFIG WARNING: bad window '{window}'")
+                continue
+
+            if is_minute_inside_window(now_minutes, start_minutes, end_minutes):
+                return window
+
+    return None
 
 def pip_size(symbol):
     symbol = symbol.upper()
@@ -508,6 +611,12 @@ def health():
             "trail_start_pips": TRAIL_START_PIPS,
             "trail_distance_pips": TRAIL_DISTANCE_PIPS,
             "trail_step_pips": TRAIL_STEP_PIPS,
+            "use_news_time_block": USE_NEWS_TIME_BLOCK,
+            "news_event_times": NEWS_EVENT_TIMES,
+            "news_block_before_minutes": NEWS_BLOCK_BEFORE_MINUTES,
+            "news_block_after_minutes": NEWS_BLOCK_AFTER_MINUTES,
+            "news_block_windows": NEWS_BLOCK_WINDOWS,
+            "active_news_block_window": active_news_block_window(),
             "allow_indicator_exits": ALLOW_INDICATOR_EXITS,
             "indicator_exit_min_profit_pips": INDICATOR_EXIT_MIN_PROFIT_PIPS,
             "indicator_exit_max_loss_pips": INDICATOR_EXIT_MAX_LOSS_PIPS
@@ -540,6 +649,15 @@ def webhook():
     if action in ["buy", "sell"]:
         if symbol in current_trades or symbol in closing_trades:
             return {"status": "ignored", "reason": "trade_already_open_or_closing"}
+
+        active_window = active_news_block_window()
+        if active_window:
+            print(f"NEWS BLOCKED ENTRY: {symbol} {action} {signal} during {active_window} Bangkok time")
+            return {
+                "status": "blocked",
+                "reason": "news_time_block",
+                "window": active_window
+            }
 
         passed, filter_reason = passes_entry_filters(data)
 
