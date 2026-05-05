@@ -34,8 +34,15 @@ LOCK_PROFIT_TRIGGER_PIPS = float(os.getenv("LOCK_PROFIT_TRIGGER_PIPS", "8"))
 LOCK_PROFIT_PIPS = float(os.getenv("LOCK_PROFIT_PIPS", "3"))
 
 # Hard early-loss protection: cuts losers before full SL, without relying on indicator exits.
+# This version is CLOSE-based: it uses the alert close/price, not the candle wick.
 USE_EARLY_LOSS_EXIT = os.getenv("USE_EARLY_LOSS_EXIT", "true").lower() == "true"
 EARLY_LOSS_EXIT_PIPS = float(os.getenv("EARLY_LOSS_EXIT_PIPS", "3"))
+
+# Trailing stop settings. The hard TP should be raised in Railway so winners can run.
+USE_TRAILING_STOP = os.getenv("USE_TRAILING_STOP", "false").lower() == "true"
+TRAIL_START_PIPS = float(os.getenv("TRAIL_START_PIPS", "8"))
+TRAIL_DISTANCE_PIPS = float(os.getenv("TRAIL_DISTANCE_PIPS", "5"))
+TRAIL_STEP_PIPS = float(os.getenv("TRAIL_STEP_PIPS", "1"))
 
 # Indicator exits act as early exits, but only when useful.
 ALLOW_INDICATOR_EXITS = os.getenv("ALLOW_INDICATOR_EXITS", "false").lower() == "true"
@@ -105,6 +112,8 @@ def correct_exit_signal(side, exit_reason):
         return "early_profit_exit_buy" if side == "buy" else "early_profit_exit_sell"
     if exit_reason == "early_loss_exit":
         return "early_loss_exit_buy" if side == "buy" else "early_loss_exit_sell"
+    if exit_reason == "trailing_stop":
+        return "trailing_stop_buy" if side == "buy" else "trailing_stop_sell"
     return "exit_buy" if side == "buy" else "exit_sell"
 
 
@@ -135,35 +144,21 @@ def price_hit_stop_or_target(trade, price=None, high=None, low=None):
 
 
 def early_loss_exit_hit(symbol, trade, price=None, high=None, low=None):
-    """Return an early-loss exit when current price action moves too far against entry.
+    """Close-based early-loss exit.
 
-    This is independent of TradingView indicator exits. It runs on normal price_update
-    alerts, so indicator exits can stay disabled while losers are still cut early.
+    IMPORTANT: This intentionally uses the alert close/price, not the candle high/low.
+    That keeps the normal 5-pip SL for breathing room, but cuts trades that actually
+    CLOSE around the early-loss threshold.
     """
-    if not USE_EARLY_LOSS_EXIT:
+    if not USE_EARLY_LOSS_EXIT or price is None:
         return None, None
 
-    side = trade["side"]
-    entry = trade["entry"]
+    current_pips = calc_pips(symbol, trade["side"], trade["entry"], price)
 
-    if price is not None:
-        high = price if high is None else high
-        low = price if low is None else low
-
-    if side == "buy":
-        worst_pips = calc_pips(symbol, "buy", entry, low)
-        if worst_pips <= -EARLY_LOSS_EXIT_PIPS:
-            exit_price = round_price(symbol, entry - pips_to_price(symbol, EARLY_LOSS_EXIT_PIPS))
-            return "early_loss_exit", exit_price
-
-    if side == "sell":
-        worst_pips = calc_pips(symbol, "sell", entry, high)
-        if worst_pips <= -EARLY_LOSS_EXIT_PIPS:
-            exit_price = round_price(symbol, entry + pips_to_price(symbol, EARLY_LOSS_EXIT_PIPS))
-            return "early_loss_exit", exit_price
+    if current_pips <= -EARLY_LOSS_EXIT_PIPS:
+        return "early_loss_exit", round_price(symbol, price)
 
     return None, None
-
 
 def best_open_profit_pips(symbol, trade, high, low):
     if trade["side"] == "buy":
@@ -197,6 +192,76 @@ def update_profit_protection(symbol, trade, high, low):
         trade["stop_reason"] = "locked_profit_exit"
         trade["lock_done"] = True
         print(f"PROTECT {symbol}: locked +{LOCK_PROFIT_PIPS} pip at stop {trade['stop_loss']}")
+
+
+def update_trailing_stop(symbol, trade, high, low):
+    """Trail behind the best price once the trade reaches TRAIL_START_PIPS.
+
+    Buy:  stop follows highest high minus TRAIL_DISTANCE_PIPS.
+    Sell: stop follows lowest low plus TRAIL_DISTANCE_PIPS.
+    The stop only moves in the trade's favor by at least TRAIL_STEP_PIPS.
+    """
+    if not USE_TRAILING_STOP:
+        return
+
+    side = trade["side"]
+    entry = trade["entry"]
+    current_stop = trade["stop_loss"]
+    step_price = pips_to_price(symbol, TRAIL_STEP_PIPS)
+
+    best_pips = best_open_profit_pips(symbol, trade, high, low)
+    trade["best_pips"] = max(float(trade.get("best_pips", 0)), best_pips)
+
+    if trade["best_pips"] < TRAIL_START_PIPS:
+        return
+
+    if side == "buy":
+        new_stop = round_price(symbol, high - pips_to_price(symbol, TRAIL_DISTANCE_PIPS))
+        if new_stop > current_stop + step_price:
+            trade["stop_loss"] = new_stop
+            trade["stop_reason"] = "trailing_stop"
+            print(f"TRAIL {symbol}: buy stop moved to {new_stop} after best +{trade['best_pips']} pips")
+
+    if side == "sell":
+        new_stop = round_price(symbol, low + pips_to_price(symbol, TRAIL_DISTANCE_PIPS))
+        if new_stop < current_stop - step_price:
+            trade["stop_loss"] = new_stop
+            trade["stop_reason"] = "trailing_stop"
+            print(f"TRAIL {symbol}: sell stop moved to {new_stop} after best +{trade['best_pips']} pips")
+
+
+def price_hit_active_stop(trade, price=None, high=None, low=None):
+    side = trade["side"]
+    stop_loss = trade["stop_loss"]
+
+    if price is not None:
+        high = price if high is None else high
+        low = price if low is None else low
+
+    if side == "buy" and low <= stop_loss:
+        return trade.get("stop_reason", "stop_loss"), stop_loss
+
+    if side == "sell" and high >= stop_loss:
+        return trade.get("stop_reason", "stop_loss"), stop_loss
+
+    return None, None
+
+
+def price_hit_emergency_take_profit(trade, price=None, high=None, low=None):
+    side = trade["side"]
+    take_profit = trade["take_profit"]
+
+    if price is not None:
+        high = price if high is None else high
+        low = price if low is None else low
+
+    if side == "buy" and high >= take_profit:
+        return "take_profit", take_profit
+
+    if side == "sell" and low <= take_profit:
+        return "take_profit", take_profit
+
+    return None, None
 
 
 def send_close_email(row):
@@ -395,6 +460,10 @@ def health():
             "lock_profit_pips": LOCK_PROFIT_PIPS,
             "use_early_loss_exit": USE_EARLY_LOSS_EXIT,
             "early_loss_exit_pips": EARLY_LOSS_EXIT_PIPS,
+            "use_trailing_stop": USE_TRAILING_STOP,
+            "trail_start_pips": TRAIL_START_PIPS,
+            "trail_distance_pips": TRAIL_DISTANCE_PIPS,
+            "trail_step_pips": TRAIL_STEP_PIPS,
             "allow_indicator_exits": ALLOW_INDICATOR_EXITS,
             "indicator_exit_min_profit_pips": INDICATOR_EXIT_MIN_PROFIT_PIPS,
             "indicator_exit_max_loss_pips": INDICATOR_EXIT_MAX_LOSS_PIPS
@@ -450,6 +519,7 @@ def webhook():
             "stop_reason": "stop_loss",
             "breakeven_done": False,
             "lock_done": False,
+            "best_pips": 0,
             "entry_signal": signal,
             "entry_time": parse_alert_time(data.get("time")),
             "entry_time_dt": datetime.now(BANGKOK_TZ)
@@ -481,23 +551,25 @@ def webhook():
         except Exception:
             return {"status": "ignored", "reason": "bad_high_low"}
 
-        # First check whether original/current stop or TP was hit.
-        exit_reason, exit_price = price_hit_stop_or_target(trade, high=high, low=low)
-        if exit_reason:
-            return close_trade(symbol, exit_price, exit_reason)
-
-        # Cut bad trades early before waiting for full SL. This does NOT depend on indicator exits.
-        exit_reason, exit_price = early_loss_exit_hit(symbol, trade, high=high, low=low)
+        # 1) Close-based early-loss check FIRST. This uses close/price, not wick high/low.
+        exit_reason, exit_price = early_loss_exit_hit(symbol, trade, price=price)
         if exit_reason:
             print(f"EARLY LOSS EXIT FROM PRICE UPDATE: {symbol} {trade['side']} at {exit_price}")
             return close_trade(symbol, exit_price, exit_reason)
 
-        # Then update protection stop based on the candle's best open profit.
+        # 2) Move stop to breakeven / locked profit before checking TP.
         update_profit_protection(symbol, trade, high, low)
 
-        # Then check again in case the same candle both reached profit protection
-        # and reversed back through the new protected stop.
-        exit_reason, exit_price = price_hit_stop_or_target(trade, high=high, low=low)
+        # 3) Trail the stop after the trade has moved far enough in your favor.
+        update_trailing_stop(symbol, trade, high, low)
+
+        # 4) Now check the active stop. This may be original SL, breakeven, locked, or trailing.
+        exit_reason, exit_price = price_hit_active_stop(trade, high=high, low=low)
+        if exit_reason:
+            return close_trade(symbol, exit_price, exit_reason)
+
+        # 5) Finally check emergency take-profit. With TP raised to 30, this no longer caps normal winners.
+        exit_reason, exit_price = price_hit_emergency_take_profit(trade, high=high, low=low)
         if exit_reason:
             return close_trade(symbol, exit_price, exit_reason)
 
@@ -518,16 +590,22 @@ def webhook():
 
         trade = current_trades[symbol]
 
-        # Safety check: never allow an exit alert to close worse than the active bot stop.
-        exit_reason, exit_price = price_hit_stop_or_target(trade, price=price)
+        # Close-based early-loss still gets priority on exit alerts.
+        exit_reason, exit_price = early_loss_exit_hit(symbol, trade, price=price)
+        if exit_reason:
+            print(f"EARLY LOSS EXIT FROM EXIT ALERT: {symbol} {trade['side']} at {exit_price}")
+            return close_trade(symbol, exit_price, exit_reason)
+
+        # Then respect the active bot stop if price is already beyond it.
+        exit_reason, exit_price = price_hit_active_stop(trade, price=price)
         if exit_reason:
             print(f"FORCED EXIT FROM EXIT ALERT: {symbol} {trade['side']} at {exit_price} reason={exit_reason}")
             return close_trade(symbol, exit_price, exit_reason)
 
-        # Even with indicator exits disabled, an exit alert can still trigger hard early-loss protection.
-        exit_reason, exit_price = early_loss_exit_hit(symbol, trade, price=price)
+        # Finally respect emergency take-profit if price is already beyond it.
+        exit_reason, exit_price = price_hit_emergency_take_profit(trade, price=price)
         if exit_reason:
-            print(f"EARLY LOSS EXIT FROM EXIT ALERT: {symbol} {trade['side']} at {exit_price}")
+            print(f"FORCED EXIT FROM EXIT ALERT: {symbol} {trade['side']} at {exit_price} reason={exit_reason}")
             return close_trade(symbol, exit_price, exit_reason)
 
         if reason == "indicator_exit" or signal in ["exit_buy", "exit_sell"]:
