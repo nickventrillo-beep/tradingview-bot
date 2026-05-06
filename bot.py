@@ -554,7 +554,9 @@ def passes_entry_filters(data):
     action = data.get("action", "").lower()
     signal = data.get("signal", "").lower()
 
-    allowed_entry_signals = ["buy_continuation", "sell_continuation"]
+    # Pullback-only mode: do NOT allow continuation entries.
+    # Continuation signals were entering after the move was already extended.
+    allowed_entry_signals = []
 
     if ALLOW_PULLBACKS:
         allowed_entry_signals += ["buy_pullback", "sell_pullback"]
