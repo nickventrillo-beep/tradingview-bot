@@ -423,7 +423,7 @@ def send_close_email(row):
         print("EMAIL SKIPPED: missing SMTP_USER, SMTP_PASSWORD, or EMAIL_TO")
         return
 
-    trade_date, symbol, side, entry, exit_price, pips, profit, lot_size, entry_signal, exit_signal, entry_time, exit_time, duration, exit_reason = row
+    trade_date, symbol, side, entry, exit_price, pips, profit, lot_size, entry_signal, market_mode, exit_signal, entry_time, exit_time, duration, exit_reason = row
 
     subject = f"Trade Closed: {symbol} {side.upper()} | {pips} pips"
 
@@ -439,6 +439,7 @@ Profit: {profit}
 Lot size: {lot_size}
 
 Entry signal: {entry_signal}
+Market mode: {market_mode}
 Exit signal: {exit_signal}
 Exit reason: {exit_reason}
 
@@ -552,6 +553,7 @@ def close_trade(symbol, exit_price, exit_reason):
             profit,
             LOT_SIZE,
             trade["entry_signal"],
+            trade.get("market_mode", "unknown"),
             exit_signal,
             format_sheet_time(entry_time_dt),
             format_sheet_time(exit_time_dt),
