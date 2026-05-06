@@ -97,7 +97,9 @@ INDICATOR_EXIT_MAX_LOSS_PIPS = float(os.getenv("INDICATOR_EXIT_MAX_LOSS_PIPS", "
 
 GOOGLE_SHEET_WEBAPP_URL = os.getenv("GOOGLE_SHEET_WEBAPP_URL", "")
 
-EMAIL_ON_CLOSE = os.getenv("EMAIL_ON_CLOSE", "true").lower() == "true"
+# Email notification toggle. Prefer ENABLE_EMAIL_NOTIFICATIONS, but keep EMAIL_ON_CLOSE as a backward-compatible fallback.
+ENABLE_EMAIL_NOTIFICATIONS = os.getenv("ENABLE_EMAIL_NOTIFICATIONS", os.getenv("EMAIL_ON_CLOSE", "true")).lower() == "true"
+EMAIL_ON_CLOSE = ENABLE_EMAIL_NOTIFICATIONS
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -666,12 +668,12 @@ def passes_entry_filters(data):
     # TREND mode: allow pullbacks and continuations.
     # SCALP mode: allow pullbacks only.
     if mode == "trend":
-        allowed_entry_signals = ["buy_pullback", "sell_pullback", "buy_continuation", "sell_continuation"]
+        allowed_entry_signals = ["buy_pullback", "sell_pullback", "buy_continuation", "sell_continuation", "buy_reversal", "sell_reversal"]
         min_adx = TREND_MIN_ADX
         min_gap = TREND_MIN_DI_GAP
         min_score = TREND_MIN_SCORE
     else:
-        allowed_entry_signals = ["buy_pullback", "sell_pullback"] if ALLOW_PULLBACKS else []
+        allowed_entry_signals = ["buy_pullback", "sell_pullback", "buy_reversal", "sell_reversal"] if ALLOW_PULLBACKS else ["buy_reversal", "sell_reversal"]
         min_adx = SCALP_MIN_ADX
         min_gap = SCALP_MIN_DI_GAP
         min_score = SCALP_MIN_SCORE
@@ -720,6 +722,7 @@ def health():
             "trail_start_pips": TRAIL_START_PIPS,
             "trail_distance_pips": TRAIL_DISTANCE_PIPS,
             "trail_step_pips": TRAIL_STEP_PIPS,
+            "email_notifications_enabled": ENABLE_EMAIL_NOTIFICATIONS,
             "use_news_time_block": USE_NEWS_TIME_BLOCK,
             "news_event_times": NEWS_EVENT_TIMES,
             "news_block_before_minutes": NEWS_BLOCK_BEFORE_MINUTES,
