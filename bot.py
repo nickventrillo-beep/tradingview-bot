@@ -41,6 +41,33 @@ LOCK_PROFIT_PIPS = float(os.getenv("LOCK_PROFIT_PIPS", "3"))
 USE_EARLY_LOSS_EXIT = os.getenv("USE_EARLY_LOSS_EXIT", "true").lower() == "true"
 EARLY_LOSS_EXIT_PIPS = float(os.getenv("EARLY_LOSS_EXIT_PIPS", "3"))
 
+# Adaptive market-mode settings.
+# Each new entry is classified as TREND or SCALP, then the trade stores its own TP/SL/protection settings.
+USE_ADAPTIVE_MODE = os.getenv("USE_ADAPTIVE_MODE", "true").lower() == "true"
+
+# TREND mode: lets winners breathe and allows pullback + continuation entries.
+TREND_MIN_ADX = float(os.getenv("TREND_MIN_ADX", "30"))
+TREND_MIN_EMA_SPREAD_PCT = float(os.getenv("TREND_MIN_EMA_SPREAD_PCT", "0.035"))
+TREND_MIN_SCORE = float(os.getenv("TREND_MIN_SCORE", "65"))
+TREND_MIN_DI_GAP = float(os.getenv("TREND_MIN_DI_GAP", "6"))
+TREND_TAKE_PROFIT_PIPS = float(os.getenv("TREND_TAKE_PROFIT_PIPS", "10"))
+TREND_STOP_LOSS_PIPS = float(os.getenv("TREND_STOP_LOSS_PIPS", "5"))
+TREND_BREAKEVEN_TRIGGER_PIPS = float(os.getenv("TREND_BREAKEVEN_TRIGGER_PIPS", "5"))
+TREND_LOCK_PROFIT_TRIGGER_PIPS = float(os.getenv("TREND_LOCK_PROFIT_TRIGGER_PIPS", "7"))
+TREND_LOCK_PROFIT_PIPS = float(os.getenv("TREND_LOCK_PROFIT_PIPS", "3"))
+TREND_EARLY_LOSS_EXIT_PIPS = float(os.getenv("TREND_EARLY_LOSS_EXIT_PIPS", "5"))
+
+# SCALP mode: defensive mode for chop/range. Pullbacks only, smaller targets.
+SCALP_MIN_ADX = float(os.getenv("SCALP_MIN_ADX", str(MIN_ADX)))
+SCALP_MIN_DI_GAP = float(os.getenv("SCALP_MIN_DI_GAP", str(MIN_DI_GAP)))
+SCALP_MIN_SCORE = float(os.getenv("SCALP_MIN_SCORE", str(MIN_SCORE)))
+SCALP_TAKE_PROFIT_PIPS = float(os.getenv("SCALP_TAKE_PROFIT_PIPS", str(TAKE_PROFIT_PIPS)))
+SCALP_STOP_LOSS_PIPS = float(os.getenv("SCALP_STOP_LOSS_PIPS", str(STOP_LOSS_PIPS)))
+SCALP_BREAKEVEN_TRIGGER_PIPS = float(os.getenv("SCALP_BREAKEVEN_TRIGGER_PIPS", str(BREAKEVEN_TRIGGER_PIPS)))
+SCALP_LOCK_PROFIT_TRIGGER_PIPS = float(os.getenv("SCALP_LOCK_PROFIT_TRIGGER_PIPS", str(LOCK_PROFIT_TRIGGER_PIPS)))
+SCALP_LOCK_PROFIT_PIPS = float(os.getenv("SCALP_LOCK_PROFIT_PIPS", str(LOCK_PROFIT_PIPS)))
+SCALP_EARLY_LOSS_EXIT_PIPS = float(os.getenv("SCALP_EARLY_LOSS_EXIT_PIPS", str(EARLY_LOSS_EXIT_PIPS)))
+
 # Trailing stop settings. The hard TP should be raised in Railway so winners can run.
 USE_TRAILING_STOP = os.getenv("USE_TRAILING_STOP", "false").lower() == "true"
 TRAIL_START_PIPS = float(os.getenv("TRAIL_START_PIPS", "8"))
@@ -273,9 +300,10 @@ def early_loss_exit_hit(symbol, trade, price=None, high=None, low=None):
     if not USE_EARLY_LOSS_EXIT or price is None:
         return None, None
 
+    early_loss_pips = float(trade.get("early_loss_exit_pips", EARLY_LOSS_EXIT_PIPS))
     current_pips = calc_pips(symbol, trade["side"], trade["entry"], price)
 
-    if current_pips <= -EARLY_LOSS_EXIT_PIPS:
+    if current_pips <= -early_loss_pips:
         return "early_loss_exit", round_price(symbol, price)
 
     return None, None
@@ -293,25 +321,28 @@ def update_profit_protection(symbol, trade, high, low):
     side = trade["side"]
     entry = trade["entry"]
     best_pips = best_open_profit_pips(symbol, trade, high, low)
+    breakeven_trigger = float(trade.get("breakeven_trigger_pips", BREAKEVEN_TRIGGER_PIPS))
+    lock_trigger = float(trade.get("lock_profit_trigger_pips", LOCK_PROFIT_TRIGGER_PIPS))
+    lock_pips = float(trade.get("lock_profit_pips", LOCK_PROFIT_PIPS))
 
     # Stage 1: move stop to breakeven once the trade has moved in your favor.
-    if best_pips >= BREAKEVEN_TRIGGER_PIPS and not trade.get("breakeven_done", False):
+    if best_pips >= breakeven_trigger and not trade.get("breakeven_done", False):
         trade["stop_loss"] = round_price(symbol, entry)
         trade["stop_reason"] = "breakeven_exit"
         trade["breakeven_done"] = True
         print(f"PROTECT {symbol}: moved stop to breakeven at {trade['stop_loss']}")
 
     # Stage 2: lock profit once the trade moves further in your favor.
-    if best_pips >= LOCK_PROFIT_TRIGGER_PIPS and not trade.get("lock_done", False):
+    if best_pips >= lock_trigger and not trade.get("lock_done", False):
         if side == "buy":
-            new_stop = entry + pips_to_price(symbol, LOCK_PROFIT_PIPS)
+            new_stop = entry + pips_to_price(symbol, lock_pips)
         else:
-            new_stop = entry - pips_to_price(symbol, LOCK_PROFIT_PIPS)
+            new_stop = entry - pips_to_price(symbol, lock_pips)
 
         trade["stop_loss"] = round_price(symbol, new_stop)
         trade["stop_reason"] = "locked_profit_exit"
         trade["lock_done"] = True
-        print(f"PROTECT {symbol}: locked +{LOCK_PROFIT_PIPS} pip at stop {trade['stop_loss']}")
+        print(f"PROTECT {symbol}: locked +{lock_pips} pip at stop {trade['stop_loss']}")
 
 
 def update_trailing_stop(symbol, trade, high, low):
@@ -550,42 +581,116 @@ def close_trade(symbol, exit_price, exit_reason):
         closing_trades.discard(symbol)
 
 
-def passes_entry_filters(data):
-    action = data.get("action", "").lower()
-    signal = data.get("signal", "").lower()
+def classify_market_mode(data, action, signal):
+    """Return TREND or SCALP for this alert.
 
-    # Pullback-only mode: do NOT allow continuation entries.
-    # Continuation signals were entering after the move was already extended.
-    allowed_entry_signals = []
-
-    if ALLOW_PULLBACKS:
-        allowed_entry_signals += ["buy_pullback", "sell_pullback"]
-
-    if signal not in allowed_entry_signals:
-        return False, "signal_not_allowed"
-
+    TREND mode is deliberately stricter about structure but looser about trade management.
+    SCALP mode is used when trend quality is not strong enough; it allows pullbacks only.
+    """
     try:
         adx = float(data.get("adx", 0))
         plus_di = float(data.get("plus_di", 0))
         minus_di = float(data.get("minus_di", 0))
         buy_score = float(data.get("buy_score", 0))
         sell_score = float(data.get("sell_score", 0))
+        ema_spread_pct = float(data.get("ema_spread_pct", 0))
+        htf_bias = float(data.get("htf_bias", 0))
     except Exception:
-        return False, "bad_filter_data"
+        return None, "bad_filter_data", {}
 
-    if adx < MIN_ADX:
-        return False, "low_adx"
+    side_score = buy_score if action == "buy" else sell_score
+    di_gap = abs(plus_di - minus_di)
+    htf_agrees = (action == "buy" and htf_bias > 0) or (action == "sell" and htf_bias < 0)
 
-    if abs(plus_di - minus_di) < MIN_DI_GAP:
-        return False, "weak_direction"
+    metrics = {
+        "adx": adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "ema_spread_pct": ema_spread_pct,
+        "htf_bias": htf_bias,
+        "side_score": side_score,
+        "di_gap": di_gap,
+        "htf_agrees": htf_agrees,
+    }
 
-    if action == "buy" and buy_score < MIN_SCORE:
-        return False, "low_buy_score"
+    is_trend_mode = (
+        USE_ADAPTIVE_MODE and
+        adx >= TREND_MIN_ADX and
+        ema_spread_pct >= TREND_MIN_EMA_SPREAD_PCT and
+        side_score >= TREND_MIN_SCORE and
+        di_gap >= TREND_MIN_DI_GAP and
+        htf_agrees
+    )
 
-    if action == "sell" and sell_score < MIN_SCORE:
-        return False, "low_sell_score"
+    if is_trend_mode:
+        return "trend", "passed", metrics
 
-    return True, "passed"
+    return "scalp", "passed", metrics
+
+
+def settings_for_mode(mode):
+    if mode == "trend":
+        return {
+            "mode": "trend",
+            "take_profit_pips": TREND_TAKE_PROFIT_PIPS,
+            "stop_loss_pips": TREND_STOP_LOSS_PIPS,
+            "breakeven_trigger_pips": TREND_BREAKEVEN_TRIGGER_PIPS,
+            "lock_profit_trigger_pips": TREND_LOCK_PROFIT_TRIGGER_PIPS,
+            "lock_profit_pips": TREND_LOCK_PROFIT_PIPS,
+            "early_loss_exit_pips": TREND_EARLY_LOSS_EXIT_PIPS,
+        }
+
+    return {
+        "mode": "scalp",
+        "take_profit_pips": SCALP_TAKE_PROFIT_PIPS,
+        "stop_loss_pips": SCALP_STOP_LOSS_PIPS,
+        "breakeven_trigger_pips": SCALP_BREAKEVEN_TRIGGER_PIPS,
+        "lock_profit_trigger_pips": SCALP_LOCK_PROFIT_TRIGGER_PIPS,
+        "lock_profit_pips": SCALP_LOCK_PROFIT_PIPS,
+        "early_loss_exit_pips": SCALP_EARLY_LOSS_EXIT_PIPS,
+    }
+
+
+def passes_entry_filters(data):
+    action = data.get("action", "").lower()
+    signal = data.get("signal", "").lower()
+
+    mode, mode_reason, metrics = classify_market_mode(data, action, signal)
+    if mode is None:
+        return False, mode_reason, None, None
+
+    # TREND mode: allow pullbacks and continuations.
+    # SCALP mode: allow pullbacks only.
+    if mode == "trend":
+        allowed_entry_signals = ["buy_pullback", "sell_pullback", "buy_continuation", "sell_continuation"]
+        min_adx = TREND_MIN_ADX
+        min_gap = TREND_MIN_DI_GAP
+        min_score = TREND_MIN_SCORE
+    else:
+        allowed_entry_signals = ["buy_pullback", "sell_pullback"] if ALLOW_PULLBACKS else []
+        min_adx = SCALP_MIN_ADX
+        min_gap = SCALP_MIN_DI_GAP
+        min_score = SCALP_MIN_SCORE
+
+    if signal not in allowed_entry_signals:
+        return False, f"signal_not_allowed_{mode}", mode, None
+
+    if metrics["adx"] < min_adx:
+        return False, f"low_adx_{mode}", mode, None
+
+    if metrics["di_gap"] < min_gap:
+        return False, f"weak_direction_{mode}", mode, None
+
+    if action == "buy" and metrics["buy_score"] < min_score:
+        return False, f"low_buy_score_{mode}", mode, None
+
+    if action == "sell" and metrics["sell_score"] < min_score:
+        return False, f"low_sell_score_{mode}", mode, None
+
+    mode_settings = settings_for_mode(mode)
+    return True, "passed", mode, mode_settings
 
 
 @app.route("/", methods=["GET"])
@@ -619,6 +724,26 @@ def health():
             "news_block_after_minutes": NEWS_BLOCK_AFTER_MINUTES,
             "news_block_windows": NEWS_BLOCK_WINDOWS,
             "active_news_block_window": active_news_block_window(),
+            "use_adaptive_mode": USE_ADAPTIVE_MODE,
+            "trend_min_adx": TREND_MIN_ADX,
+            "trend_min_ema_spread_pct": TREND_MIN_EMA_SPREAD_PCT,
+            "trend_min_score": TREND_MIN_SCORE,
+            "trend_min_di_gap": TREND_MIN_DI_GAP,
+            "trend_take_profit_pips": TREND_TAKE_PROFIT_PIPS,
+            "trend_stop_loss_pips": TREND_STOP_LOSS_PIPS,
+            "trend_breakeven_trigger_pips": TREND_BREAKEVEN_TRIGGER_PIPS,
+            "trend_lock_profit_trigger_pips": TREND_LOCK_PROFIT_TRIGGER_PIPS,
+            "trend_lock_profit_pips": TREND_LOCK_PROFIT_PIPS,
+            "trend_early_loss_exit_pips": TREND_EARLY_LOSS_EXIT_PIPS,
+            "scalp_min_adx": SCALP_MIN_ADX,
+            "scalp_min_di_gap": SCALP_MIN_DI_GAP,
+            "scalp_min_score": SCALP_MIN_SCORE,
+            "scalp_take_profit_pips": SCALP_TAKE_PROFIT_PIPS,
+            "scalp_stop_loss_pips": SCALP_STOP_LOSS_PIPS,
+            "scalp_breakeven_trigger_pips": SCALP_BREAKEVEN_TRIGGER_PIPS,
+            "scalp_lock_profit_trigger_pips": SCALP_LOCK_PROFIT_TRIGGER_PIPS,
+            "scalp_lock_profit_pips": SCALP_LOCK_PROFIT_PIPS,
+            "scalp_early_loss_exit_pips": SCALP_EARLY_LOSS_EXIT_PIPS,
             "allow_indicator_exits": ALLOW_INDICATOR_EXITS,
             "indicator_exit_min_profit_pips": INDICATOR_EXIT_MIN_PROFIT_PIPS,
             "indicator_exit_max_loss_pips": INDICATOR_EXIT_MAX_LOSS_PIPS
@@ -661,18 +786,21 @@ def webhook():
                 "window": active_window
             }
 
-        passed, filter_reason = passes_entry_filters(data)
+        passed, filter_reason, market_mode, mode_settings = passes_entry_filters(data)
 
         if not passed:
             print(f"FILTERED {symbol} {action} {signal}: {filter_reason}")
-            return {"status": "filtered", "reason": filter_reason}
+            return {"status": "filtered", "reason": filter_reason, "market_mode": market_mode}
+
+        stop_loss_pips = float(mode_settings["stop_loss_pips"])
+        take_profit_pips = float(mode_settings["take_profit_pips"])
 
         if action == "buy":
-            stop_loss = round_price(symbol, price - pips_to_price(symbol, STOP_LOSS_PIPS))
-            take_profit = round_price(symbol, price + pips_to_price(symbol, TAKE_PROFIT_PIPS))
+            stop_loss = round_price(symbol, price - pips_to_price(symbol, stop_loss_pips))
+            take_profit = round_price(symbol, price + pips_to_price(symbol, take_profit_pips))
         else:
-            stop_loss = round_price(symbol, price + pips_to_price(symbol, STOP_LOSS_PIPS))
-            take_profit = round_price(symbol, price - pips_to_price(symbol, TAKE_PROFIT_PIPS))
+            stop_loss = round_price(symbol, price + pips_to_price(symbol, stop_loss_pips))
+            take_profit = round_price(symbol, price - pips_to_price(symbol, take_profit_pips))
 
         current_trades[symbol] = {
             "symbol": symbol,
@@ -685,11 +813,18 @@ def webhook():
             "lock_done": False,
             "best_pips": 0,
             "entry_signal": signal,
+            "market_mode": market_mode,
+            "stop_loss_pips": stop_loss_pips,
+            "take_profit_pips": take_profit_pips,
+            "breakeven_trigger_pips": float(mode_settings["breakeven_trigger_pips"]),
+            "lock_profit_trigger_pips": float(mode_settings["lock_profit_trigger_pips"]),
+            "lock_profit_pips": float(mode_settings["lock_profit_pips"]),
+            "early_loss_exit_pips": float(mode_settings["early_loss_exit_pips"]),
             "entry_time": parse_alert_time(data.get("time")),
             "entry_time_dt": datetime.now(BANGKOK_TZ)
         }
 
-        print(f"OPENED {symbol} {action} | entry={price} | SL={stop_loss} | TP={take_profit}")
+        print(f"OPENED {symbol} {action} | mode={market_mode} | entry={price} | SL={stop_loss} | TP={take_profit}")
 
         return {
             "status": "opened",
@@ -697,7 +832,8 @@ def webhook():
             "side": action,
             "entry": price,
             "stop_loss": stop_loss,
-            "take_profit": take_profit
+            "take_profit": take_profit,
+            "market_mode": market_mode
         }
 
     if action == "update":
